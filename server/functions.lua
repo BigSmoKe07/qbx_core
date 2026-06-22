@@ -27,11 +27,27 @@ end
 
 exports('GetSource', GetSource)
 
+---@param identifier Identifier
+---@return integer source of the player with the matching identifier or 0 if no player found
+function GetUserId(identifier)
+    for src in pairs(QBX.Players) do
+        local idens = GetPlayerIdentifiers(src)
+        for _, id in pairs(idens) do
+            if identifier == id then
+                return QBX.Players[src].PlayerData.userId
+            end
+        end
+    end
+    return 0
+end
+
+exports('GetUserId', GetUserId)
+
 ---@param source Source|string source or identifier of the player
 ---@return Player
 function GetPlayer(source)
-    if type(source) == 'number' then
-        return QBX.Players[source]
+    if tonumber(source) ~= nil then
+        return QBX.Players[tonumber(source)]
     else
         return QBX.Players[GetSource(source --[[@as string]])]
     end
@@ -50,6 +66,18 @@ function GetPlayerByCitizenId(citizenid)
 end
 
 exports('GetPlayerByCitizenId', GetPlayerByCitizenId)
+
+---@param userId string
+---@return Player?
+function GetPlayerByUserId(userId)
+    for src in pairs(QBX.Players) do
+        if QBX.Players[src].PlayerData.userId == userId then
+            return QBX.Players[src]
+        end
+    end
+end
+
+exports('GetPlayerByUserId', GetPlayerByUserId)
 
 ---@param number string
 ---@return Player?
@@ -235,6 +263,7 @@ function AddPermission(source, permission)
 end
 
 ---@deprecated use cfg ACEs instead
+---@diagnostic disable-next-line: deprecated
 exports('AddPermission', AddPermission)
 
 ---@deprecated use cfg ACEs instead
@@ -250,6 +279,8 @@ function RemovePermission(source, permission)
         end
     else
         local hasUpdated = false
+
+        ---@diagnostic disable-next-line: deprecated
         for _, v in pairs(serverConfig.permissions) do
             if IsPlayerAceAllowed(source --[[@as string]], v) then
                 lib.removePrincipal('player.' .. source, 'group.' .. v)
@@ -265,6 +296,7 @@ function RemovePermission(source, permission)
 end
 
 ---@deprecated use cfg ACEs instead
+---@diagnostic disable-next-line: deprecated
 exports('RemovePermission', RemovePermission)
 
 -- Checking for Permission Level
@@ -285,6 +317,7 @@ function HasPermission(source, permission)
 end
 
 ---@deprecated use IsPlayerAceAllowed
+---@diagnostic disable-next-line: deprecated
 exports('HasPermission', HasPermission)
 
 ---@deprecated use cfg ACEs instead
@@ -292,6 +325,8 @@ exports('HasPermission', HasPermission)
 ---@return table<string, boolean>
 function GetPermission(source)
     local perms = {}
+
+    ---@diagnostic disable-next-line: deprecated
     for _, v in pairs (serverConfig.permissions) do
         if IsPlayerAceAllowed(source --[[@as string]], v) then
             perms[v] = true
@@ -301,16 +336,18 @@ function GetPermission(source)
 end
 
 ---@deprecated use cfg ACEs instead
+---@diagnostic disable-next-line: deprecated
 exports('GetPermission', GetPermission)
 
 -- Opt in or out of admin reports
 ---@param source Source
 ---@return boolean
 function IsOptin(source)
+    if not serverConfig.requireOptIn then return true end
     local license = GetPlayerIdentifierByType(source --[[@as string]], 'license2') or GetPlayerIdentifierByType(source --[[@as string]], 'license')
     if not license or not IsPlayerAceAllowed(source --[[@as string]], 'admin') then return false end
     local player = GetPlayer(source)
-    return player.PlayerData.optin
+    return player.PlayerData.metadata.optin
 end
 
 exports('IsOptin', IsOptin)
@@ -321,8 +358,8 @@ function ToggleOptin(source)
     local license = GetPlayerIdentifierByType(source --[[@as string]], 'license2') or GetPlayerIdentifierByType(source --[[@as string]], 'license')
     if not license or not IsPlayerAceAllowed(source --[[@as string]], 'admin') then return end
     local player = GetPlayer(source)
-    player.PlayerData.optin = not player.PlayerData.optin
-    player.Functions.SetPlayerData('optin', player.PlayerData.optin)
+    player.PlayerData.metadata.optin = not player.PlayerData.metadata.optin
+    player.Functions.SetMetaData('optin', player.PlayerData.metadata.optin)
 end
 
 exports('ToggleOptin', ToggleOptin)
@@ -332,21 +369,23 @@ exports('ToggleOptin', ToggleOptin)
 ---@return boolean
 ---@return string? playerMessage
 function IsPlayerBanned(source)
-    local plicense = GetPlayerIdentifierByType(source --[[@as string]], 'license2') or GetPlayerIdentifierByType(source --[[@as string]], 'license')
-    local result = storage.fetchBan({
-        license = plicense
-    })
+    local request = {
+        { license = GetPlayerIdentifierByType(source --[[@as string]], 'license') },
+        { license = GetPlayerIdentifierByType(source --[[@as string]], 'license2') },
+        { discordId = GetPlayerIdentifierByType(source --[[@as string]], 'discord') },
+        { ip = GetPlayerIdentifierByType(source --[[@as string]], 'ip') },
+    }
+
+    local result = storage.fetchBan(request)
     if not result then return false end
+
     if os.time() < result.expire then
         local timeTable = os.date('*t', tonumber(result.expire))
+
         return true, ('You have been banned from the server:\n%s\nYour ban expires in %s/%s/%s %s:%s\n'):format(result.reason, timeTable.day, timeTable.month, timeTable.year, timeTable.hour, timeTable.min)
-    else
-        CreateThread(function()
-            storage.deleteBan({
-                license = plicense
-            })
-        end)
     end
+
+    storage.deleteBan(request)
     return false
 end
 
@@ -385,7 +424,7 @@ exports('Notify', Notify)
 ---@return string version
 local function GetCoreVersion(InvokingResource)
     ---@diagnostic disable-next-line: missing-parameter
-    local resourceVersion = GetResourceMetadata(GetCurrentResourceName(), 'version')
+    local resourceVersion = GetResourceMetadata(cache.resource, 'version')
     if InvokingResource and InvokingResource ~= '' then
         lib.print.debug(('%s called qbcore version check: %s'):format(InvokingResource or 'Unknown Resource', resourceVersion))
     end
@@ -398,18 +437,16 @@ exports('GetCoreVersion', GetCoreVersion)
 ---@param origin string reason
 local function ExploitBan(playerId, origin)
     local name = GetPlayerName(playerId)
-    CreateThread(function()
-        local success, errorResult = storage.insertBan({
-            name = name,
-            license = GetPlayerIdentifierByType(playerId --[[@as string]], 'license2') or GetPlayerIdentifierByType(playerId --[[@as string]], 'license'),
-            discordId = GetPlayerIdentifierByType(playerId --[[@as string]], 'discord'),
-            ip = GetPlayerIdentifierByType(playerId --[[@as string]], 'ip'),
-            reason = origin,
-            expiration = 2147483647,
-            bannedBy = 'Anti Cheat'
-        })
-        assert(success, errorResult)
-    end)
+    local success, errorResult = storage.insertBan({
+        name = name,
+        license = GetPlayerIdentifierByType(playerId --[[@as string]], 'license2') or GetPlayerIdentifierByType(playerId --[[@as string]], 'license'),
+        discordId = GetPlayerIdentifierByType(playerId --[[@as string]], 'discord'),
+        ip = GetPlayerIdentifierByType(playerId --[[@as string]], 'ip'),
+        reason = origin,
+        expiration = 2147483647,
+        bannedBy = 'Anti Cheat'
+    })
+    if not success then lib.print.error(errorResult) end
     DropPlayer(playerId --[[@as string]], locale('info.exploit_banned', serverConfig.discord))
     logger.log({
         source = 'qbx_core',
@@ -417,7 +454,7 @@ local function ExploitBan(playerId, origin)
         event = 'Anti-Cheat',
         color = 'red',
         tags = loggingConfig.role,
-        message = ('%s has been banned for exploiting %s'):format(name, origin)
+        message = success and ('%s has been kicked and banned for exploiting %s'):format(name, origin) or ('%s has been kicked for exploiting %s, ban insert failed'):format(name, origin)
     })
 end
 
@@ -428,7 +465,84 @@ exports('ExploitBan', ExploitBan)
 ---@return boolean
 function HasPrimaryGroup(source, filter)
     local playerData = QBX.Players[source].PlayerData
-    return HasPlayerGotGroup(filter, playerData)
+    return HasPlayerGotGroup(filter, playerData, true)
 end
 
 exports('HasPrimaryGroup', HasPrimaryGroup)
+
+---@param source Source
+---@param filter string | string[] | table<string, number>
+---@return boolean
+function HasGroup(source, filter)
+    local playerData = QBX.Players[source].PlayerData
+    return HasPlayerGotGroup(filter, playerData)
+end
+
+exports('HasGroup', HasGroup)
+
+---@param source Source
+---@return table<string, integer>
+function GetGroups(source)
+    local playerData = QBX.Players[source].PlayerData
+    return GetPlayerGroups(playerData)
+end
+
+exports('GetGroups', GetGroups)
+
+---@return PlayerData[]
+local function getPlayersData()
+    local playersData = {}
+    for _, player in pairs(QBX.Players) do
+        playersData[#playersData + 1] = player.PlayerData
+    end
+    return playersData
+end
+
+exports('GetPlayersData', getPlayersData)
+
+---@param filters table <string, any>
+---@return Player[]
+local function searchPlayerEntities(filters)
+    local result = {}
+    local response = storage.searchPlayerEntities(filters)
+    for i = 1, #response do
+        local citizenid = response[i].citizenid
+        local player = GetPlayerByCitizenId(citizenid)
+        if player then
+            result[#result+1] = player
+        else
+            local offlinePlayer = GetOfflinePlayer(citizenid)
+            if offlinePlayer then
+                result[#result+1] = offlinePlayer
+            end
+        end
+    end
+    return result
+end
+
+exports("SearchPlayers", searchPlayerEntities)
+
+local function isGradeBoss(group, grade)
+    local groupData = GetJob(group) or GetGang(group)
+    if not groupData then return end
+    return groupData.grades[grade].isboss
+end
+
+exports('IsGradeBoss', isGradeBoss)
+
+local function getGroupMembers(group, type)
+    return storage.fetchGroupMembers(group, type)
+end
+
+exports('GetGroupMembers', getGroupMembers)
+
+---Disables persistence before deleting a vehicle, then deletes it.
+---@param vehicle number
+function DeleteVehicle(vehicle)
+    DisablePersistence(vehicle)
+    if DoesEntityExist(vehicle) then
+        DeleteEntity(vehicle)
+    end
+end
+
+exports('DeleteVehicle', DeleteVehicle)

@@ -1,9 +1,10 @@
 fx_version 'cerulean'
 game 'gta5'
 
-description 'QBX_Core'
+name 'qbx_core'
+description 'The core resource for the Qbox Framework'
 repository 'https://github.com/Qbox-project/qbx_core'
-version '1.15.1'
+version '1.23.0'
 
 ox_lib 'locale'
 
@@ -22,11 +23,13 @@ client_scripts {
     'client/events.lua',
     'client/character.lua',
     'client/discord.lua',
+    'client/vehicle-persistence.lua',
     'bridge/qb/client/main.lua',
 }
 
 server_scripts {
     '@oxmysql/lib/MySQL.lua',
+    'server/motd.lua',
     'server/main.lua',
     'server/groups.lua',
     'server/functions.lua',
@@ -35,11 +38,13 @@ server_scripts {
     'server/commands.lua',
     'server/loops.lua',
     'server/character.lua',
+    'server/vehicle-persistence.lua',
     'bridge/qb/server/main.lua',
 }
 
 files {
     'modules/*.lua',
+    'data/*.lua',
     'shared/gangs.lua',
     'shared/items.lua',
     'shared/jobs.lua',
@@ -58,7 +63,7 @@ files {
 }
 
 dependencies {
-    '/server:7290',
+    '/server:10731',
     '/onesync',
     'ox_lib',
     'oxmysql',

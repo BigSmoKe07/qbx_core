@@ -17,7 +17,7 @@ functions.GetCoords = function(entity) -- luacheck: ignore
     return vec4(coords.x, coords.y, coords.z, GetEntityHeading(entity))
 end
 
----@deprecated use https://overextended.dev/ox_inventory/Functions/Client#search
+---@deprecated use https://coxdocs.dev/ox_inventory/Functions/Client#search
 functions.HasItem = function(items, amount)
     amount = amount or 1
     local count = exports.ox_inventory:Search('count', items)
@@ -81,10 +81,36 @@ functions.LoadAnimSet = lib.requestAnimSet
 ---@param canCancel boolean
 ---@param disableControls? {disableMovement: boolean, disableCarMovement: boolean, disableCombat: boolean, disableMouse: boolean}
 ---@param animation? {animDict: string, anim: string, flags: unknown}
----@param prop? unknown
+---@param prop? {model: string, bone?: number, coords?: vector3|table, rotation?: vector3|table}
+---@param propTwo? {model: string, bone?: number, coords?: vector3|table, rotation?: vector3|table}
 ---@param onFinish fun()
 ---@param onCancel fun()
-function functions.Progressbar(_, label, duration, useWhileDead, canCancel, disableControls, animation, prop, _, onFinish, onCancel)
+function functions.Progressbar(_, label, duration, useWhileDead, canCancel, disableControls, animation, prop, propTwo, onFinish, onCancel)
+    local props
+
+    if prop?.model then
+        local propData = {
+            model = prop.model,
+            bone = prop.bone,
+            pos = prop.coords,
+            rot = prop.rotation,
+        }
+
+        if propTwo?.model then
+            props = {
+                propData,
+                {
+                    model = propTwo.model,
+                    bone = propTwo.bone,
+                    pos = propTwo.coords,
+                    rot = propTwo.rotation,
+                },
+            }
+        else
+            props = propData
+        end
+    end
+
     if lib.progressBar({
         duration = duration,
         label = label,
@@ -101,11 +127,7 @@ function functions.Progressbar(_, label, duration, useWhileDead, canCancel, disa
             clip = animation?.anim,
             flags = animation?.flags
         },
-        prop = {
-            model = prop?.model,
-            pos = prop?.coords,
-            rot = prop?.rotation,
-        },
+        prop = props,
     }) then
         if onFinish then
             onFinish()
@@ -417,7 +439,7 @@ function functions.SetVehicleProperties(vehicle, props)
     props.modRoofLivery = props.modRoofLivery or props.liveryRoof
 
     --- lib.setVehicleProperties copied and pasted from Overextended below so that we can remove the error so that setting properties is best effort
-    assert(DoesEntityExist(vehicle), string.format('Unable to set vehicle properties for "%s" (entity does not exist)', vehicle))
+    assert(DoesEntityExist(vehicle), ('Unable to set vehicle properties for "%s" (entity does not exist)'):format(vehicle))
 
     if NetworkGetEntityIsNetworked(vehicle) and NetworkGetEntityOwner(vehicle) ~= cache.playerId then
         lib.print.warn('setting vehicle properties on non entity owner client. This may cause certain properties to fail to set. entity:', vehicle)
@@ -896,7 +918,7 @@ end
 ---@param duration? integer milliseconds notification will remain on screen. Defaults to 5000
 ---@param subTitle? string extra text under the title
 ---@param notifyPosition? NotificationPosition
----@param notifyStyle? table Custom styling. Please refer too https://overextended.dev/ox_lib/Modules/Interface/Client/notify#libnotify
+---@param notifyStyle? table Custom styling. Please refer too https://coxdocs.dev/ox_lib/Modules/Interface/Client/notify#libnotify
 ---@param notifyIcon? string Font Awesome 6 icon name
 ---@param notifyIconColor? string Custom color for the icon chosen before
 function functions.Notify(text, notifyType, duration, subTitle, notifyPosition, notifyStyle, notifyIcon, notifyIconColor)

@@ -3,7 +3,6 @@ local logger = require 'modules.logger'
 
 GlobalState.PVPEnabled = config.server.pvp
 
--- Teleport
 lib.addCommand('tp', {
     help = locale('command.tp.help'),
     params = {
@@ -13,6 +12,8 @@ lib.addCommand('tp', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     if args[locale('command.tp.params.x.name')] and not args[locale('command.tp.params.y.name')] and not args[locale('command.tp.params.z.name')] then
         local target = GetPlayerPed(tonumber(args[locale('command.tp.params.x.name')]) --[[@as number]])
         if target ~= 0 then
@@ -41,18 +42,20 @@ lib.addCommand('tpm', {
     help = locale('command.tpm.help'),
     restricted = 'group.admin'
 }, function(source)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     TriggerClientEvent('QBCore:Command:GoToMarker', source)
 end)
 
 lib.addCommand('togglepvp', {
     help = locale('command.togglepvp.help'),
     restricted = 'group.admin'
-}, function()
+}, function(source)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     config.server.pvp = not config.server.pvp
     GlobalState.PVPEnabled = config.server.pvp
 end)
-
--- Permissions
 
 lib.addCommand('addpermission', {
     help = locale('command.addpermission.help'),
@@ -62,6 +65,8 @@ lib.addCommand('addpermission', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.addpermission.params.id.name')])
     local permission = args[locale('command.addpermission.params.permission.name')]
     if not player then
@@ -69,6 +74,7 @@ lib.addCommand('addpermission', {
         return
     end
 
+    ---@diagnostic disable-next-line: deprecated
     AddPermission(player.PlayerData.source, permission)
 end)
 
@@ -80,6 +86,8 @@ lib.addCommand('removepermission', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.removepermission.params.id.name')])
     local permission = args[locale('command.removepermission.params.permission.name')]
     if not player then
@@ -87,15 +95,16 @@ lib.addCommand('removepermission', {
         return
     end
 
+    ---@diagnostic disable-next-line: deprecated
     RemovePermission(player.PlayerData.source, permission)
 end)
-
--- Open & Close Server
 
 lib.addCommand('openserver', {
     help = locale('command.openserver.help'),
     restricted = 'group.admin'
 }, function(source)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     if not config.server.closed then
         Notify(source, locale('error.server_already_open'), 'error')
         return
@@ -116,6 +125,8 @@ lib.addCommand('closeserver', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     if config.server.closed then
         Notify(source, locale('error.server_already_closed'), 'error')
         return
@@ -127,7 +138,7 @@ lib.addCommand('closeserver', {
         config.server.closedReason = reason
         for k in pairs(QBX.Players) do
             if not IsPlayerAceAllowed(k --[[@as string]], config.server.whitelistPermission) then
-                DropPlayer(k, reason)
+                DropPlayer(k --[[@as string]], reason)
             end
         end
 
@@ -137,8 +148,6 @@ lib.addCommand('closeserver', {
     end
 end)
 
--- Vehicle
-
 lib.addCommand('car', {
     help = locale('command.car.help'),
     params = {
@@ -147,19 +156,22 @@ lib.addCommand('car', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     if not args then return end
 
-    local ped = GetPlayerPed(source)
+    local ped, bucket = GetPlayerPed(source), GetPlayerRoutingBucket(source)
     local keepCurrentVehicle = args[locale('command.car.params.keepCurrentVehicle.name')]
     local currentVehicle = not keepCurrentVehicle and GetVehiclePedIsIn(ped, false)
     if currentVehicle and currentVehicle ~= 0 then
-        DeleteEntity(currentVehicle)
+        DeleteVehicle(currentVehicle)
     end
 
     local _, vehicle = qbx.spawnVehicle({
         model = args[locale('command.car.params.model.name')],
         spawnSource = ped,
         warp = true,
+        bucket = bucket
     })
 
     local plate = qbx.getVehiclePlate(vehicle)
@@ -173,6 +185,8 @@ lib.addCommand('dv', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local ped = GetPlayerPed(source)
     local pedCars = {GetVehiclePedIsIn(ped, false)}
     local radius = args[locale('command.dv.params.radius.name')]
@@ -187,13 +201,11 @@ lib.addCommand('dv', {
         for i = 1, #pedCars do
             local pedCar = NetworkGetEntityFromNetworkId(pedCars[i])
             if pedCar and DoesEntityExist(pedCar) then
-                DeleteEntity(pedCar)
+                DeleteVehicle(pedCar)
             end
         end
     end
 end)
-
--- Money
 
 lib.addCommand('givemoney', {
     help = locale('command.givemoney.help'),
@@ -204,6 +216,8 @@ lib.addCommand('givemoney', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.givemoney.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
@@ -222,6 +236,8 @@ lib.addCommand('setmoney', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.setmoney.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
@@ -231,7 +247,6 @@ lib.addCommand('setmoney', {
     player.Functions.SetMoney(args[locale('command.setmoney.params.moneytype.name')], args[locale('command.setmoney.params.amount.name')])
 end)
 
--- Job
 lib.addCommand('job', {
     help = locale('command.job.help')
 }, function(source)
@@ -248,16 +263,17 @@ lib.addCommand('setjob', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.setjob.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
         return
     end
 
-    player.Functions.SetJob(args[locale('command.setjob.params.job.name')], args[locale('command.setjob.params.grade.name')] or 0)
+    local success, errorResult = player.Functions.SetJob(args[locale('command.setjob.params.job.name')], args[locale('command.setjob.params.grade.name')] or 0)
+    assert(success, json.encode(errorResult))
 end)
-
---- ADMIN COMMAND
 
 lib.addCommand('changejob', {
     help = locale('command.changejob.help'),
@@ -267,13 +283,16 @@ lib.addCommand('changejob', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.changejob.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
         return
     end
 
-    SetPlayerPrimaryJob(player.PlayerData.citizenid, args[locale('command.changejob.params.job.name')])
+    local success, errorResult = SetPlayerPrimaryJob(player.PlayerData.citizenid, args[locale('command.changejob.params.job.name')])
+    assert(success, json.encode(errorResult))
 end)
 
 lib.addCommand('addjob', {
@@ -285,13 +304,16 @@ lib.addCommand('addjob', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.addjob.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
         return
     end
 
-    AddPlayerToJob(player.PlayerData.citizenid, args[locale('command.addjob.params.job.name')], args[locale('command.addjob.params.grade.name')] or 0)
+    local success, errorResult = AddPlayerToJob(player.PlayerData.citizenid, args[locale('command.addjob.params.job.name')], args[locale('command.addjob.params.grade.name')] or 0)
+    assert(success, json.encode(errorResult))
 end)
 
 lib.addCommand('removejob', {
@@ -302,16 +324,17 @@ lib.addCommand('removejob', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.removejob.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
         return
     end
 
-    RemovePlayerFromJob(player.PlayerData.citizenid, args[locale('command.removejob.params.job.name')])
+    local success, errorResult = RemovePlayerFromJob(player.PlayerData.citizenid, args[locale('command.removejob.params.job.name')])
+    assert(success, json.encode(errorResult))
 end)
-
--- Gang
 
 lib.addCommand('gang', {
     help = locale('command.gang.help')
@@ -329,16 +352,17 @@ lib.addCommand('setgang', {
     },
     restricted = 'group.admin'
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args[locale('command.setgang.params.id.name')])
     if not player then
         Notify(source, locale('error.not_online'), 'error')
         return
     end
 
-    player.Functions.SetGang(args[locale('command.setgang.params.gang.name')], args[locale('command.setgang.params.grade.name')] or 0)
+    local success, errorResult = player.Functions.SetGang(args[locale('command.setgang.params.gang.name')], args[locale('command.setgang.params.grade.name')] or 0)
+    assert(success, json.encode(errorResult))
 end)
-
--- Out of Character Chat
 
 lib.addCommand('ooc', {
     help = locale('command.ooc.help')
@@ -351,20 +375,20 @@ lib.addCommand('ooc', {
     local playerCoords = GetEntityCoords(GetPlayerPed(source))
     for _, v in pairs(players) do
         if v == source then
-            TriggerClientEvent('chat:addMessage', v --[[@as Source]], {
+            exports.chat:addMessage(v --[[@as Source]], {
                 color = { 0, 0, 255},
                 multiline = true,
                 args = {('OOC | %s'):format(GetPlayerName(source)), message}
             })
         elseif #(playerCoords - GetEntityCoords(GetPlayerPed(v))) < 20.0 then
-            TriggerClientEvent('chat:addMessage', v --[[@as Source]], {
+            exports.chat:addMessage(v --[[@as Source]], {
                 color = { 0, 0, 255},
                 multiline = true,
                 args = {('OOC | %s'):format(GetPlayerName(source)), message}
             })
         elseif IsPlayerAceAllowed(v --[[@as string]], 'admin') then
             if IsOptin(v --[[@as Source]]) then
-                TriggerClientEvent('chat:addMessage', v --[[@as Source]], {
+                exports.chat:addMessage(v--[[@as Source]], {
                     color = { 0, 0, 255},
                     multiline = true,
                     args = {('Proximity OOC | %s'):format(GetPlayerName(source)), message}
@@ -382,7 +406,14 @@ lib.addCommand('ooc', {
     end
 end)
 
--- Me command
+function sanitizeTags(msg)
+    return msg
+        :gsub("&", "&amp;")
+        :gsub("<", "&lt;")
+        :gsub(">", "&gt;")
+        :gsub('"', "&quot;")
+        :gsub("'", "&apos;")
+end
 
 lib.addCommand('me', {
     help = locale('command.me.help'),
@@ -393,7 +424,7 @@ lib.addCommand('me', {
     args[1] = args[locale('command.me.params.message.name')]
     args[locale('command.me.params.message.name')] = nil
     if #args < 1 then Notify(source, locale('error.missing_args2'), 'error') return end
-    local msg = table.concat(args, ' '):gsub('[~<].-[>~]', '')
+    local msg = sanitizeTags(table.concat(args, ' '))
     local playerState = Player(source).state
     playerState:set('me', msg, true)
 
@@ -401,13 +432,9 @@ lib.addCommand('me', {
     playerState:set('me', nil, true)
 end)
 
--- ID command
-
 lib.addCommand('id', {help = locale('info.check_id')}, function(source)
     Notify(source, 'ID: ' .. source)
 end)
-
--- Character commands
 
 lib.addCommand('logout', {
     help = locale('info.logout_command_help'),
@@ -421,6 +448,8 @@ lib.addCommand('deletechar', {
         { name = 'id', help = locale('info.deletechar_command_arg_player_id'), type = 'number' },
     }
 }, function(source, args)
+    if not IsOptin(source) then Notify(source, locale('error.not_optin'), 'error') return end
+
     local player = GetPlayer(args.id)
     if not player then return end
 
@@ -428,3 +457,13 @@ lib.addCommand('deletechar', {
     ForceDeleteCharacter(citizenId)
     Notify(source, locale('success.character_deleted_citizenid', citizenId))
 end)
+
+if config.server.requireOptIn then
+    lib.addCommand('optin', {
+        help = locale('command.optin.help'),
+        restricted = 'group.admin'
+    }, function(source, args)
+        ToggleOptin(source)
+        Notify(source, locale('success.optin_set', IsOptin(source) and 'in' or 'out'))
+    end)
+end

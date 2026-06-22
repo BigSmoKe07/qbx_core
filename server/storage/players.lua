@@ -1,14 +1,40 @@
 local defaultSpawn = require 'config.shared'.defaultSpawn
 local characterDataTables = require 'config.server'.characterDataTables
 
----@class InsertBanRequest
----@field name string
----@field license? string
----@field discordId? string
----@field ip? string
----@field reason string
----@field bannedBy string
----@field expiration integer epoch second that the ban will expire
+local function createUsersTable()
+    MySQL.query([[
+        CREATE TABLE IF NOT EXISTS `users` (
+            `userId` int UNSIGNED NOT NULL AUTO_INCREMENT,
+            `username` varchar(255) DEFAULT NULL,
+            `license` varchar(50) DEFAULT NULL,
+            `license2` varchar(50) DEFAULT NULL,
+            `fivem` varchar(20) DEFAULT NULL,
+            `discord` varchar(30) DEFAULT NULL,
+            PRIMARY KEY (`userId`)
+        ) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    ]])
+end
+
+---@param identifiers table<PlayerIdentifier, string>
+---@return number?
+local function createUser(identifiers)
+    return MySQL.insert.await('INSERT INTO users (username, license, license2, fivem, discord) VALUES (?, ?, ?, ?, ?)', {
+        identifiers.username,
+        identifiers.license,
+        identifiers.license2,
+        identifiers.fivem,
+        identifiers.discord,
+    })
+end
+
+---@param identifier string
+---@return integer?
+local function fetchUserByIdentifier(identifier)
+    local idType = identifier:match('([^:]+)')
+    local select = ('SELECT `userId` FROM `users` WHERE `%s` = ? LIMIT 1'):format(idType)
+
+    return MySQL.scalar.await(select, { identifier })
+end
 
 ---@param request InsertBanRequest
 ---@return boolean success
@@ -33,54 +59,53 @@ local function insertBan(request)
     return true
 end
 
----@param request GetBanRequest
----@return string column in storage
----@return string value of the id
-local function getBanId(request)
-    if request.license then
-        return 'license', request.license
-    elseif request.discordId then
-        return 'discord', request.discordId
-    elseif request.ip then
-        return 'ip', request.ip
-    else
-        error('no identifier provided', 2)
+local banColumns = {
+    license = 'license',
+    discordId = 'discord',
+    ip = 'ip',
+}
+
+---@param request GetBanRequest | GetBanRequest[]
+---@return string clause, string[] values
+local function buildBanFilter(request)
+    local requests = request[1] and request or { request }
+    local clauses = {}
+    local values = {}
+    for i = 1, #requests do
+        for key, column in pairs(banColumns) do
+            local value = requests[i][key]
+            if value then
+                clauses[#clauses + 1] = column .. ' = ?'
+                values[#values + 1] = value
+            end
+        end
     end
+    return table.concat(clauses, ' OR '), values
 end
 
----@class GetBanRequest
----@field license? string
----@field discordId? string
----@field ip? string
-
----@class BanEntity
----@field expire integer epoch second that the ban will expire
----@field reason string
-
----@param request GetBanRequest
+---@param request GetBanRequest | GetBanRequest[]
 ---@return BanEntity?
 local function fetchBan(request)
-    local column, value = getBanId(request)
-    local result = MySQL.single.await('SELECT expire, reason FROM bans WHERE ' ..column.. ' = ?', { value })
+    local clause, values = buildBanFilter(request)
+    if clause == '' then return nil end
+    local result = MySQL.single.await('SELECT expire, reason FROM bans WHERE ' .. clause .. ' ORDER BY expire DESC', values)
     return result and {
         expire = result.expire,
         reason = result.reason,
     } or nil
 end
 
----@param request GetBanRequest
+---@param request GetBanRequest | GetBanRequest[]
 local function deleteBan(request)
-    local column, value = getBanId(request)
-    MySQL.query.await('DELETE FROM bans WHERE ' ..column.. ' = ?', { value })
+    local clause, values = buildBanFilter(request)
+    if clause == '' then return end
+    MySQL.query.await('DELETE FROM bans WHERE ' .. clause, values)
 end
-
----@class UpsertPlayerRequest
----@field playerEntity PlayerEntity
----@field position vector3
 
 ---@param request UpsertPlayerRequest
 local function upsertPlayerEntity(request)
-    MySQL.insert.await('INSERT INTO players (citizenid, cid, license, name, money, charinfo, job, gang, position, metadata, last_logged_out) VALUES (:citizenid, :cid, :license, :name, :money, :charinfo, :job, :gang, :position, :metadata, :last_logged_out) ON DUPLICATE KEY UPDATE name = :name, money = :money, charinfo = :charinfo, job = :job, gang = :gang, position = :position, metadata = :metadata, last_logged_out = :last_logged_out', {
+    MySQL.insert.await('INSERT INTO players (userId, citizenid, cid, license, name, money, charinfo, job, gang, position, metadata, last_logged_out) VALUES (:userId, :citizenid, :cid, :license, :name, :money, :charinfo, :job, :gang, :position, :metadata, :last_logged_out) ON DUPLICATE KEY UPDATE userId = :userId, name = :name, money = :money, charinfo = :charinfo, job = :job, gang = :gang, position = :position, metadata = :metadata, last_logged_out = :last_logged_out', {
+        userId = request.playerEntity.userId,
         citizenid = request.playerEntity.citizenid,
         cid = request.playerEntity.charinfo.cid,
         license = request.playerEntity.license,
@@ -94,90 +119,6 @@ local function upsertPlayerEntity(request)
         last_logged_out = os.date('%Y-%m-%d %H:%M:%S', request.playerEntity.lastLoggedOut)
     })
 end
-
----@class PlayerEntity
----@field citizenid string
----@field license string
----@field name string
----@field money Money
----@field charinfo PlayerCharInfo
----@field job? PlayerJob
----@field gang? PlayerGang
----@field position vector4
----@field metadata PlayerMetadata
----@field cid integer
----@field lastLoggedOut integer
----@field items table deprecated
-
----@class PlayerEntityDatabase : PlayerEntity
----@field charinfo string
----@field money string
----@field job? string
----@field gang? string
----@field position string
----@field metadata string
----@field lastLoggedOutUnix integer
-
----@class PlayerCharInfo
----@field firstname string
----@field lastname string
----@field birthdate string
----@field nationality string
----@field cid integer
----@field gender integer
----@field backstory string
----@field phone string
----@field account string
----@field card number
-
----@class PlayerMetadata
----@field health number
----@field armor number
----@field hunger number
----@field thirst number
----@field stress number
----@field isdead boolean
----@field inlaststand boolean
----@field ishandcuffed boolean
----@field tracker boolean
----@field injail number time in minutes
----@field jailitems table TODO: expand
----@field status table TODO: expand
----@field phone {background: any, profilepicture: any} TODO: figure out more specific types
----@field bloodtype BloodType
----@field dealerrep number
----@field craftingrep number
----@field attachmentcraftingrep number
----@field currentapartment? integer apartmentId
----@field jobrep {tow: number, trucker: number, taxi: number, hotdog: number}
----@field callsign string
----@field fingerprint string
----@field walletid string
----@field criminalrecord {hasRecord: boolean, date?: table} TODO: date is os.date(), create better type than table
----@field licences {id: boolean, driver: boolean, weapon: boolean}
----@field inside {house?: any, apartment: {apartmentType?: any, apartmentId?: integer}} TODO: expand
----@field phonedata {SerialNumber: string, InstalledApps: table} TODO: expand
-
----@class PlayerJob
----@field name string
----@field label string
----@field payment number
----@field type? string
----@field onduty boolean
----@field isboss boolean
----@field grade {name: string, level: number}
-
----@class PlayerGang
----@field name string
----@field label string
----@field isboss boolean
----@field grade {name: string, level: number}
-
----@class PlayerSkin
----@field citizenid string
----@field model string
----@field skin string
----@field active integer
 
 ---@param citizenId string
 ---@return PlayerSkin?
@@ -198,7 +139,7 @@ local function fetchAllPlayerEntities(license2, license)
     ---@type PlayerEntity[]
     local chars = {}
     ---@type PlayerEntityDatabase[]
-    local result = MySQL.query.await('SELECT citizenid, charinfo, money, job, gang, position, metadata, UNIX_TIMESTAMP(last_logged_out) AS lastLoggedOutUnix FROM players WHERE license = ? OR license = ?', {license, license2})
+    local result = MySQL.query.await('SELECT citizenid, charinfo, money, job, gang, position, metadata, UNIX_TIMESTAMP(last_logged_out) AS lastLoggedOutUnix FROM players WHERE license = ? OR license = ? ORDER BY cid', {license, license2})
     for i = 1, #result do
         chars[i] = result[i]
         chars[i].charinfo = json.decode(result[i].charinfo)
@@ -217,9 +158,10 @@ end
 ---@return PlayerEntity?
 local function fetchPlayerEntity(citizenId)
     ---@type PlayerEntityDatabase
-    local player = MySQL.single.await('SELECT citizenid, license, name, charinfo, money, job, gang, position, metadata, UNIX_TIMESTAMP(last_logged_out) AS lastLoggedOutUnix FROM players WHERE citizenid = ?', { citizenId })
-    local charinfo = json.decode(player.charinfo)
+    local player = MySQL.single.await('SELECT userId, citizenid, license, name, charinfo, money, job, gang, position, metadata, UNIX_TIMESTAMP(last_logged_out) AS lastLoggedOutUnix FROM players WHERE citizenid = ?', { citizenId })
+    local charinfo = player and json.decode(player.charinfo)
     return player and {
+        userId = player.userId,
         citizenid = player.citizenid,
         license = player.license,
         name = player.name,
@@ -232,6 +174,74 @@ local function fetchPlayerEntity(citizenId)
         metadata = json.decode(player.metadata),
         lastLoggedOut = player.lastLoggedOutUnix
     } or nil
+end
+
+---@param filters table<string, any>
+local function handleSearchFilters(filters)
+    if not (filters) then return '', {} end
+    local holders = {}
+    local clauses = {}
+    if filters.license then
+        clauses[#clauses + 1] = 'license = ?'
+        holders[#holders + 1] = filters.license
+    end
+    if filters.job then
+        clauses[#clauses + 1] = 'JSON_EXTRACT(job, "$.name") = ?'
+        holders[#holders + 1] = filters.job
+    end
+    if filters.gang then
+        clauses[#clauses + 1] = 'JSON_EXTRACT(gang, "$.name") = ?'
+        holders[#holders + 1] = filters.gang
+    end
+    if filters.charinfo then
+        for key, value in pairs(filters.charinfo) do
+            if type(value) == "number" then
+                clauses[#clauses + 1] = 'JSON_EXTRACT(charinfo, ?) = ?'
+                holders[#holders + 1] = '$.' .. key
+                holders[#holders + 1] = value
+            elseif type(value) == "string" then
+                clauses[#clauses + 1] = 'JSON_UNQUOTE(JSON_EXTRACT(charinfo, ?)) = ?'
+                holders[#holders + 1] = '$.' .. key
+                holders[#holders + 1] = value
+            end
+        end
+    end
+    if filters.metadata then
+        local strict = filters.metadata.strict
+        for key, value in pairs(filters.metadata) do
+            if key ~= "strict" then
+                if type(value) == "number" then
+                    if strict then
+                        clauses[#clauses + 1] = 'JSON_EXTRACT(metadata, ?) = ?'
+                    else
+                        clauses[#clauses + 1] = 'JSON_EXTRACT(metadata, ?) >= ?'
+                    end
+                    holders[#holders + 1] = '$.' .. key
+                    holders[#holders + 1] = value
+                elseif type(value) == "boolean" then
+                    clauses[#clauses + 1] = 'JSON_EXTRACT(metadata, ?) = ?'
+                    holders[#holders + 1] = '$.' .. key
+                    holders[#holders + 1] = tostring(value)
+                elseif type(value) == "string" then
+                    clauses[#clauses + 1] = 'JSON_UNQUOTE(JSON_EXTRACT(metadata, ?)) = ?'
+                    holders[#holders + 1] = '$.' .. key
+                    holders[#holders + 1] = value
+                end
+            end
+        end
+    end
+    return (' WHERE %s'):format(table.concat(clauses, ' AND ')), holders
+end
+
+---@param filters table <string, any>
+---@return PlayerEntityDatabase[]
+local function searchPlayerEntities(filters)
+    local query = "SELECT citizenid FROM players"
+    local where, holders = handleSearchFilters(filters)
+    lib.print.debug(query .. where)
+    ---@type PlayerEntityDatabase[]
+    local response = MySQL.query.await(query .. where, holders)
+    return response
 end
 
 ---Checks if a table exists in the database
@@ -323,13 +333,25 @@ local function fetchPlayerGroups(citizenid)
     local gangs = {}
     for i = 1, #groups do
         local group = groups[i]
-        if group.type == GroupType.JOB then
+        local validGroup = group.type == GroupType.JOB and GetJob(group.group) or GetGang(group.group)
+        if not validGroup then
+            lib.print.warn(('Invalid group %s found in player_groups table, Does it exist in shared/%ss.lua?'):format(group.group, group.type))
+        elseif not validGroup.grades?[group.grade] then
+            lib.print.warn(('Invalid grade %s found in player_groups table for %s %s, Does it exist in shared/%ss.lua?'):format(group.grade, group.type, group.group, group.type))
+        elseif group.type == GroupType.JOB then
             jobs[group.group] = group.grade
-        else
+        elseif group.type == GroupType.GANG then
             gangs[group.group] = group.grade
         end
     end
     return jobs, gangs
+end
+
+---@param group string
+---@param type GroupType
+---@return table<string, integer> players
+local function fetchGroupMembers(group, type)
+    return MySQL.query.await("SELECT citizenid, grade FROM player_groups WHERE `group` = ? AND `type` = ?", {group, type})
 end
 
 ---@param citizenid string
@@ -354,7 +376,7 @@ end
 ---Copies player's primary job/gang to the player_groups table. Works for online/offline players.
 ---Idempotent
 RegisterCommand('convertjobs', function(source)
-	if source ~= 0 then return warn('This command can only be executed using the server console.') end
+    if source ~= 0 then return warn('This command can only be executed using the server console.') end
 
     local players = MySQL.query.await('SELECT citizenid, JSON_VALUE(job, \'$.name\') AS jobName, JSON_VALUE(job, \'$.grade.level\') AS jobGrade, JSON_VALUE(gang, \'$.name\') AS gangName, JSON_VALUE(gang, \'$.grade.level\') AS gangGrade FROM players')
     for i = 1, #players do
@@ -369,6 +391,29 @@ RegisterCommand('convertjobs', function(source)
     TriggerEvent('qbx_core:server:jobsconverted')
 end, true)
 
+---Removes invalid groups from the player_groups table.
+local function cleanPlayerGroups()
+    local groups = MySQL.query.await('SELECT DISTINCT `group`, type, grade FROM player_groups')
+    for i = 1, #groups do
+        local group = groups[i]
+        local validGroup = group.type == GroupType.JOB and GetJob(group.group) or GetGang(group.group)
+        if not validGroup then
+            MySQL.query.await('DELETE FROM player_groups WHERE `group` = ? AND type = ?', {group.group, group.type})
+            lib.print.info(('Remove invalid %s %s from player_groups table'):format(group.type, group.group))
+        elseif not validGroup.grades?[group.grade] then
+            MySQL.query.await('DELETE FROM player_groups WHERE `group` = ? AND type = ? AND grade = ?', {group.group, group.type, group.grade})
+            lib.print.info(('Remove invalid %s %s grade %s from player_groups table'):format(group.type, group.group, group.grade))
+        end
+    end
+
+    lib.print.info('Removed invalid groups from player_groups table')
+end
+
+RegisterCommand('cleanplayergroups', function(source)
+    if source ~= 0 then return warn('This command can only be executed using the server console.') end
+    cleanPlayerGroups()
+end, true)
+
 CreateThread(function()
     for _, data in pairs(characterDataTables) do
         local tableName = data[1]
@@ -376,9 +421,15 @@ CreateThread(function()
             warn(('Table \'%s\' does not exist in database, please remove it from qbx_core/config/server.lua or create the table'):format(tableName))
         end
     end
+    if GetConvar('qbx:cleanPlayerGroups', 'false') == 'true' then
+        cleanPlayerGroups()
+    end
 end)
 
 return {
+    createUsersTable = createUsersTable,
+    createUser = createUser,
+    fetchUserByIdentifier = fetchUserByIdentifier,
     insertBan = insertBan,
     fetchBan = fetchBan,
     deleteBan = deleteBan,
@@ -391,6 +442,8 @@ return {
     addPlayerToJob = addPlayerToJob,
     addPlayerToGang = addPlayerToGang,
     fetchPlayerGroups = fetchPlayerGroups,
+    fetchGroupMembers = fetchGroupMembers,
     removePlayerFromJob = removePlayerFromJob,
     removePlayerFromGang = removePlayerFromGang,
+    searchPlayerEntities = searchPlayerEntities,
 }

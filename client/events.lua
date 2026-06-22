@@ -1,3 +1,5 @@
+local config = require 'config.client'
+
 -- Player load and unload handling
 RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
     ShutdownLoadingScreenNui()
@@ -7,12 +9,23 @@ RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
         SetCanAttackFriendly(cache.ped, true, false)
         NetworkSetFriendlyFireOption(true)
     end
+
+    NetworkEndTutorialSession()
+
+    while NetworkIsInTutorialSession() do
+        Wait(0)
+    end
+
+    local motd = GetConvar('qbx:motd', '')
+    if motd ~= '' then
+        exports.chat:addMessage({ template = motd })
+    end
 end)
 
 ---@param val PlayerData
 RegisterNetEvent('QBCore:Player:SetPlayerData', function(val)
     local invokingResource = GetInvokingResource()
-    if invokingResource and invokingResource ~= GetCurrentResourceName() then return end
+    if invokingResource and invokingResource ~= cache.resource then return end
     QBX.PlayerData = val
 end)
 
@@ -21,6 +34,7 @@ RegisterNetEvent('QBCore:Client:OnPlayerUnload', function()
 end)
 
 ---@param value boolean
+---@diagnostic disable-next-line: param-type-mismatch
 AddStateBagChangeHandler('PVPEnabled', nil, function(bagName, _, value)
     if bagName == 'global' then
         SetCanAttackFriendly(cache.ped, value, false)
@@ -32,6 +46,8 @@ end)
 
 ---@param coords vector3
 RegisterNetEvent('QBCore:Command:TeleportToPlayer', function(coords)
+    if GetInvokingResource() then return end
+
     SetPedCoordsKeepVehicle(cache.ped, coords.x, coords.y, coords.z)
 end)
 
@@ -40,6 +56,8 @@ end)
 ---@param z number
 ---@param h number
 RegisterNetEvent('QBCore:Command:TeleportToCoords', function(x, y, z, h)
+    if GetInvokingResource() then return end
+    
     SetPedCoordsKeepVehicle(cache.ped, x, y, z)
     SetEntityHeading(cache.ped, h or GetEntityHeading(cache.ped))
 end)
@@ -53,7 +71,7 @@ RegisterNetEvent('QBCore:Command:GoToMarker', function()
     end
 
     -- Fade screen to hide how clients get teleported.
-    DoScreenFadeOut(650)
+    DoScreenFadeOut(config.teleport.fadeDuration)
     while not IsScreenFadedOut() do
         Wait(0)
     end
@@ -64,7 +82,7 @@ RegisterNetEvent('QBCore:Command:GoToMarker', function()
 
     -- Unpack coords instead of having to unpack them while iterating.
     -- 825.0 seems to be the max a player can reach while 0.0 being the lowest.
-    local x, y, groundZ, Z_START = coords.x, coords.y, 850.0, 950.0
+    local x, y, groundZ, Z_START = coords.x, coords.y, config.teleport.groundSearchMaxZ, config.teleport.groundSearchStartZ
     local found = false
     if vehicle > 0 then
         FreezeEntityPosition(vehicle, true)
@@ -72,16 +90,16 @@ RegisterNetEvent('QBCore:Command:GoToMarker', function()
         FreezeEntityPosition(ped, true)
     end
 
-    for i = Z_START, 0, -25.0 do
+    for i = Z_START, 0, config.teleport.groundSearchStep do
         local z = i
         if (i % 2) ~= 0 then
             z = Z_START - i
         end
 
-        NewLoadSceneStart(x, y, z, x, y, z, 50.0, 0)
+        NewLoadSceneStart(x, y, z, x, y, z, config.teleport.loadSceneRadius, 0)
         local curTime = GetGameTimer()
         while IsNetworkLoadingScene() do
-            if GetGameTimer() - curTime > 1000 then
+            if GetGameTimer() - curTime > config.teleport.timeout then
                 break
             end
             Wait(0)
@@ -91,7 +109,7 @@ RegisterNetEvent('QBCore:Command:GoToMarker', function()
 
         while not HasCollisionLoadedAroundEntity(ped) do
             RequestCollisionAtCoord(x, y, z)
-            if GetGameTimer() - curTime > 1000 then
+            if GetGameTimer() - curTime > config.teleport.timeout then
                 break
             end
             Wait(0)
@@ -108,7 +126,7 @@ RegisterNetEvent('QBCore:Command:GoToMarker', function()
     end
 
     -- Remove black screen once the loop has ended.
-    DoScreenFadeIn(650)
+    DoScreenFadeIn(config.teleport.fadeDuration)
     if vehicle > 0 then
         FreezeEntityPosition(vehicle, false)
     else
@@ -130,7 +148,7 @@ end)
 -- Vehicle Commands
 
 lib.callback.register('qbx_core:client:getVehiclesInRadius', function(radius)
-    local vehicles = lib.getNearbyVehicles(GetEntityCoords(cache.ped), radius or 5, true)
+    local vehicles = lib.getNearbyVehicles(GetEntityCoords(cache.ped), radius or config.getVehiclesInRadius.defaultRadius, true)
 
     for i = 1, #vehicles do
         vehicles[i] = VehToNet(vehicles[i].vehicle)
@@ -150,6 +168,7 @@ end)
 
 ---@param bagName string
 ---@param value string
+---@diagnostic disable-next-line: param-type-mismatch
 AddStateBagChangeHandler('me', nil, function(bagName, _, value)
     if not value then return end
 
@@ -164,10 +183,10 @@ AddStateBagChangeHandler('me', nil, function(bagName, _, value)
     if not DoesEntityExist(playerPed) then return end
 
     -- Distance check to make sure that players do not see others me from 100s of meters away --
-    if not isLocalPlayer and #(GetEntityCoords(playerPed) - GetEntityCoords(cache.ped)) > 25 then return end
+    if not isLocalPlayer and #(GetEntityCoords(playerPed) - GetEntityCoords(cache.ped)) > config.meCommand.distance then return end
 
     CreateThread(function()
-        local displayTime = 5000 + GetGameTimer()
+        local displayTime = config.meCommand.displayTime + GetGameTimer()
         while displayTime > GetGameTimer() do
             playerPed = isLocalPlayer and cache.ped or GetPlayerPed(playerId)
             qbx.drawText3d({text = value, coords = GetEntityCoords(playerPed)})
@@ -195,29 +214,24 @@ RegisterNetEvent('QBCore:Client:OnSharedUpdateMultiple', function(tableName, val
 end)
 
 -- Set vehicle props
----@param vehicle number
+---@param netId number
 ---@param props table<any, any>
-qbx.entityStateHandler('setVehicleProperties', function(vehicle, _, props)
+RegisterNetEvent('qbx_core:client:setVehicleProperties', function(netId, props)
     if not props then return end
-
-    SetTimeout(0, function()
-        local state = Entity(vehicle).state
-
-        local timeOut = GetGameTimer() + 10000
-
-        while state.setVehicleProperties do
-            if NetworkGetEntityOwner(vehicle) == cache.playerId then
-                if lib.setVehicleProperties(vehicle, props) then
-                    state:set('setVehicleProperties', nil, true)
-                end
+    local timeOut = GetGameTimer() + config.setVehicleProperties.timeout
+    local vehicle = NetworkGetEntityFromNetworkId(netId)
+    while true do
+        if NetworkGetEntityOwner(vehicle) == cache.playerId then
+            if lib.setVehicleProperties(vehicle, props) then
+                return
             end
-            if GetGameTimer() > timeOut then
-                break
-            end
-
-            Wait(50)
         end
-    end)
+        if GetGameTimer() > timeOut then
+            return
+        end
+
+        Wait(config.setVehicleProperties.waitInterval)
+    end
 end)
 
 -- Clear vehicle peds
@@ -226,7 +240,7 @@ end)
 qbx.entityStateHandler('initVehicle', function(vehicle, _, init)
     if not init then return end
 
-    for i = -1, 0 do
+    for _, i in ipairs(config.initVehicle.seats) do
         local ped = GetPedInVehicleSeat(vehicle, i)
         if ped ~= cache.ped and ped > 0 and NetworkGetEntityOwner(ped) == cache.playerId then
             DeleteEntity(ped)

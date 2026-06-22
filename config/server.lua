@@ -8,7 +8,7 @@ return {
         moneyTypes = { cash = 500, bank = 5000, crypto = 0 }, -- type = startamount - Add or remove money types for your server (for ex. blackmoney = 0), remember once added it will not be removed from the database!
         dontAllowMinus = { 'cash', 'crypto' }, -- Money that is not allowed going in minus
         paycheckTimeout = 10, -- The time in minutes that it will give the paycheck
-        paycheckSociety = false -- If true paycheck will come from the society account that the player is employed at, requires qb-management
+        paycheckSociety = false -- If true paycheck will come from the society account that the player is employed at
     },
 
     player = {
@@ -61,13 +61,12 @@ return {
     ---@type [TableName, ColumnName][]
     characterDataTables = {
         {'properties', 'owner'},
-        {'apartments', 'citizenid'},
         {'bank_accounts_new', 'id'},
         {'playerskins', 'citizenid'},
-        {'player_houses', 'citizenid'},
         {'player_mails', 'citizenid'},
         {'player_outfits', 'citizenid'},
         {'player_vehicles', 'citizenid'},
+        {'player_groups', 'citizenid'},
         {'players', 'citizenid'},
         {'npwd_calls', 'identifier'},
         {'npwd_darkchat_channel_members', 'user_identifier'},
@@ -89,6 +88,7 @@ return {
         discord = '', -- Discord invite link
         checkDuplicateLicense = false, -- Check for duplicate rockstar license on join
         ---@deprecated use cfg ACE system instead
+        requireOptIn = true, -- Set to false to disable the requirement to use the /optin command before accessing admin commands
         permissions = { 'god', 'admin', 'mod' }, -- Add as many groups as you want here after creating them in your server.cfg
     },
 
@@ -112,8 +112,16 @@ return {
         role = {} -- Role to tag for high priority logs. Roles use <@%roleid> and users/channels are <@userid/channelid>
     },
 
+    persistence = {
+        lockState = 'lock', -- 'lock' : vehicle will be locked when spawned, 'unlock' : vehicle will be unlocked when spawned
+    },
+
     giveVehicleKeys = function(src, plate, vehicle)
-        return exports.qbx_vehiclekeys:GiveKeys(src, plate)
+        return exports.qbx_vehiclekeys:GiveKeys(src, vehicle)
+    end,
+
+    setVehicleLock = function(vehicle, state)
+        exports.qbx_vehiclekeys:SetLockState(vehicle, state)
     end,
 
     getSocietyAccount = function(accountName)
@@ -122,5 +130,13 @@ return {
 
     removeSocietyMoney = function(accountName, payment)
         return exports['Renewed-Banking']:removeAccountMoney(accountName, payment)
+    end,
+
+    ---Paycheck function
+    ---@param player Player Player object
+    ---@param payment number Payment amount
+    sendPaycheck = function (player, payment)
+        player.Functions.AddMoney('bank', payment)
+        Notify(player.PlayerData.source, locale('info.received_paycheck', payment))
     end,
 }

@@ -2,16 +2,26 @@ local config = require 'config.server'
 local defaultSpawn = require 'config.shared'.defaultSpawn
 local logger = require 'modules.logger'
 local storage = require 'server.storage.main'
+local triggerEventHooks = require 'modules.hooks'
 local maxJobsPerPlayer = GetConvarInt('qbx:max_jobs_per_player', 1)
 local maxGangsPerPlayer = GetConvarInt('qbx:max_gangs_per_player', 1)
 local setJobReplaces = GetConvar('qbx:setjob_replaces', 'true') == 'true'
 local setGangReplaces = GetConvar('qbx:setgang_replaces', 'true') == 'true'
+local accounts = json.decode(GetConvar('inventory:accounts', '["money"]'))
+local accountsAsItems = table.create(0, #accounts)
 
----@class PlayerData : PlayerEntity
----@field jobs table<string, integer>
----@field gangs table<string, integer>
----@field source? Source present if player is online
----@field optin? boolean present if player is online
+for i = 1, #accounts do
+    accountsAsItems[accounts[i]] = 0
+end
+
+-- Numeric metadata mirrored from client statebags. Values are validated and
+-- clamped before being persisted, so a spoofed statebag can't corrupt or crash
+-- these stats. Add new bounded stats here rather than special-casing them below.
+local numericMetadata = {
+    hunger = { min = 0, max = 100 },
+    thirst = { min = 0, max = 100 },
+    stress = { min = 0, max = 100 },
+}
 
 ---@param source Source
 ---@param citizenid? string
@@ -23,15 +33,34 @@ function Login(source, citizenid, newData)
         return false
     end
 
+    if QBX.Players[source] then
+        DropPlayer(tostring(source), locale('info.exploit_dropped'))
+        logger.log({
+            source = GetInvokingResource() or cache.resource,
+            webhook = config.logging.webhook.anticheat,
+            event = 'Anti-Cheat',
+            color = 'white',
+            tags = config.logging.role,
+            message = ('%s [%s] Dropped for attempting to login twice'):format(GetPlayerName(tostring(source)), tostring(source))
+        })
+        return false
+    end
+
+    local license, license2 = GetPlayerIdentifierByType(source --[[@as string]], 'license'), GetPlayerIdentifierByType(source --[[@as string]], 'license2')
+    local userId = license2 and storage.fetchUserByIdentifier(license2) or storage.fetchUserByIdentifier(license)
+    if not userId then
+        lib.print.error('User does not exist. Licenses checked:', license2, license)
+        return false
+    end
     if citizenid then
-        local license, license2 = GetPlayerIdentifierByType(source --[[@as string]], 'license'), GetPlayerIdentifierByType(source --[[@as string]], 'license2')
         local playerData = storage.fetchPlayerEntity(citizenid)
-        if playerData and (license2 == playerData.license or license == playerData.license) then
-            return not not CheckPlayerData(source, playerData)
+        if playerData and (playerData.license == license2 or playerData.license == license) then
+            playerData.userId = userId
+            return CheckPlayerData(source, playerData) ~= nil
         else
             DropPlayer(tostring(source), locale('info.exploit_dropped'))
             logger.log({
-                source = 'qbx_core',
+                source = GetInvokingResource() or cache.resource,
                 webhook = config.logging.webhook.anticheat,
                 event = 'Anti-Cheat',
                 color = 'white',
@@ -40,8 +69,10 @@ function Login(source, citizenid, newData)
             })
         end
     else
+        newData.userId = userId
+
         local player = CheckPlayerData(source, newData)
-        player.Functions.Save()
+        Save(player.PlayerData.source)
         return true
     end
 
@@ -61,6 +92,72 @@ end
 
 exports('GetOfflinePlayer', GetOfflinePlayer)
 
+---Overwrites current primary job with a new job. Removing the player from their current primary job
+---@param identifier Source | string
+---@param jobName string name
+---@param grade? integer defaults to 0
+---@return boolean success if job was set
+---@return ErrorResult? errorResult
+function SetJob(identifier, jobName, grade)
+    jobName = jobName:lower()
+    grade = tonumber(grade) or 0
+
+    local job = GetJob(jobName)
+
+    if not job then
+        lib.print.error(('cannot set job. Job %s does not exist'):format(jobName))
+
+        return false
+    end
+
+    if not job.grades[grade] then
+        lib.print.error(('cannot set job. Job %s does not have grade %s'):format(jobName, grade))
+
+        return false
+    end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if setJobReplaces and player.PlayerData.job.name ~= 'unemployed' then
+        local success, errorResult = RemovePlayerFromJob(player.PlayerData.citizenid, player.PlayerData.job.name)
+
+        if not success then
+            return false, errorResult
+        end
+    end
+
+    if jobName ~= 'unemployed' then
+        local success, errorResult = AddPlayerToJob(player.PlayerData.citizenid, jobName, grade)
+
+        if not success then
+            return false, errorResult
+        end
+    end
+
+    return SetPlayerPrimaryJob(player.PlayerData.citizenid, jobName)
+end
+
+exports('SetJob', SetJob)
+
+---@param identifier Source | string
+---@param onDuty boolean
+function SetJobDuty(identifier, onDuty)
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return end
+
+    player.PlayerData.job.onduty = not not onDuty
+
+    if player.Offline then return end
+
+    TriggerEvent('QBCore:Server:SetDuty', player.PlayerData.source, player.PlayerData.job.onduty)
+    TriggerClientEvent('QBCore:Client:SetDuty', player.PlayerData.source, player.PlayerData.job.onduty)
+
+    UpdatePlayerData(identifier)
+end
+
+exports('SetJobDuty', SetJobDuty)
+
 ---@param jobName string
 ---@param job Job
 ---@param grade integer
@@ -70,6 +167,7 @@ local function toPlayerJob(jobName, job, grade)
         name = jobName,
         label = job.label,
         isboss = job.grades[grade].isboss or false,
+        bankAuth = job.grades[grade].bankAuth or false,
         onduty = job.defaultDuty or false,
         payment = job.grades[grade].payment or 0,
         type = job.type,
@@ -90,7 +188,7 @@ function SetPlayerPrimaryJob(citizenid, jobName)
     if not player then
         return false, {
             code = 'player_not_found',
-            message = string.format('player not found with citizenid %s', citizenid)
+            message = ('player not found with citizenid %s'):format(citizenid)
         }
     end
 
@@ -98,7 +196,7 @@ function SetPlayerPrimaryJob(citizenid, jobName)
     if not grade then
         return false, {
             code = 'player_not_in_job',
-            message = string.format('player %s does not have job %s', citizenid, jobName)
+            message = ('player %s does not have job %s'):format(citizenid, jobName)
         }
     end
 
@@ -106,17 +204,19 @@ function SetPlayerPrimaryJob(citizenid, jobName)
     if not job then
         return false, {
             code = 'job_not_found',
-            message = jobName .. ' does not exist in core memory'
+            message = ('%s does not exist in core memory'):format(jobName)
         }
     end
 
-    assert(job.grades[grade] ~= nil, string.format('job %s does not have grade %s', jobName, grade))
+    assert(job.grades[grade] ~= nil, ('job %s does not have grade %s'):format(jobName, grade))
 
     player.PlayerData.job = toPlayerJob(jobName, job, grade)
-    player.Functions.Save()
 
-    if not player.Offline then
-        player.Functions.UpdatePlayerData()
+    if player.Offline then
+        SaveOffline(player.PlayerData)
+    else
+        Save(player.PlayerData.source)
+        UpdatePlayerData(player.PlayerData.source)
         TriggerEvent('QBCore:Server:OnJobUpdate', player.PlayerData.source, player.PlayerData.job)
         TriggerClientEvent('QBCore:Client:OnJobUpdate', player.PlayerData.source, player.PlayerData.job)
     end
@@ -129,10 +229,13 @@ exports('SetPlayerPrimaryJob', SetPlayerPrimaryJob)
 ---Adds a player to the job or overwrites their grade for a job already held
 ---@param citizenid string
 ---@param jobName string
----@param grade integer
+---@param grade? integer
 ---@return boolean success
 ---@return ErrorResult? errorResult
 function AddPlayerToJob(citizenid, jobName, grade)
+    jobName = jobName:lower()
+    grade = tonumber(grade) or 0
+
     -- unemployed job is the default, so players cannot be added to it
     if jobName == 'unemployed' then
         return false, {
@@ -145,14 +248,14 @@ function AddPlayerToJob(citizenid, jobName, grade)
     if not job then
         return false, {
             code = 'job_not_found',
-            message = jobName .. ' does not exist in core memory'
+            message = ('%s does not exist in core memory'):format(jobName)
         }
     end
 
     if not job.grades[grade] then
         return false, {
             code = 'job_missing_grade',
-            message = string.format('job %s does not have grade %s', jobName, grade),
+            message = ('job %s does not have grade %s'):format(jobName, grade),
         }
     end
 
@@ -160,7 +263,7 @@ function AddPlayerToJob(citizenid, jobName, grade)
     if not player then
         return false, {
             code = 'player_not_found',
-            message = string.format('player not found with citizenid %s', citizenid)
+            message = ('player not found with citizenid %s'):format(citizenid)
         }
     end
 
@@ -179,7 +282,7 @@ function AddPlayerToJob(citizenid, jobName, grade)
 
     if not player.Offline then
         player.PlayerData.jobs[jobName] = grade
-        player.Functions.SetPlayerData('jobs', player.PlayerData.jobs)
+        SetPlayerData(player.PlayerData.source, 'jobs', player.PlayerData.jobs)
         TriggerEvent('qbx_core:server:onGroupUpdate', player.PlayerData.source, jobName, grade)
         TriggerClientEvent('qbx_core:client:onGroupUpdate', player.PlayerData.source, jobName, grade)
     end
@@ -210,7 +313,7 @@ function RemovePlayerFromJob(citizenid, jobName)
     if not player then
         return false, {
             code = 'player_not_found',
-            message = string.format('player not found with citizenid %s', citizenid)
+            message = ('player not found with citizenid %s'):format(citizenid)
         }
     end
 
@@ -225,11 +328,15 @@ function RemovePlayerFromJob(citizenid, jobName)
         local job = GetJob('unemployed')
         assert(job ~= nil, 'cannot find unemployed job. Does it exist in shared/jobs.lua?')
         player.PlayerData.job = toPlayerJob('unemployed', job, 0)
-        player.Functions.Save()
+        if player.Offline then
+            SaveOffline(player.PlayerData)
+        else
+            Save(player.PlayerData.source)
+        end
     end
 
     if not player.Offline then
-        player.Functions.SetPlayerData('jobs', player.PlayerData.jobs)
+        SetPlayerData(player.PlayerData.source, 'jobs', player.PlayerData.jobs)
         TriggerEvent('qbx_core:server:onGroupUpdate', player.PlayerData.source, jobName)
         TriggerClientEvent('qbx_core:client:onGroupUpdate', player.PlayerData.source, jobName)
     end
@@ -239,17 +346,64 @@ end
 
 exports('RemovePlayerFromJob', RemovePlayerFromJob)
 
+---Removes the player from their current primary gang and adds the player to the new gang
+---@param identifier Source | string
+---@param gangName string name
+---@param grade? integer defaults to 0
+---@return boolean success if gang was set
+---@return ErrorResult? errorResult
+function SetGang(identifier, gangName, grade)
+    gangName = gangName:lower()
+    grade = tonumber(grade) or 0
+
+    local gang = GetGang(gangName)
+
+    if not gang then
+        lib.print.error(('cannot set gang. Gang %s does not exist'):format(gangName))
+
+        return false
+    end
+
+    if not gang.grades[grade] then
+        lib.print.error(('cannot set gang. Gang %s does not have grade %s'):format(gangName, grade))
+
+        return false
+    end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if setGangReplaces and player.PlayerData.gang.name ~= 'none' then
+        local success, errorResult = RemovePlayerFromGang(player.PlayerData.citizenid, player.PlayerData.gang.name)
+
+        if not success then
+            return false, errorResult
+        end
+    end
+
+    if gangName ~= 'none' then
+        local success, errorResult = AddPlayerToGang(player.PlayerData.citizenid, gangName, grade)
+
+        if not success then
+            return false, errorResult
+        end
+    end
+
+    return SetPlayerPrimaryGang(player.PlayerData.citizenid, gangName)
+end
+
+exports('SetGang', SetGang)
+
 ---Sets a player's gang to be primary only if they already have it.
 ---@param citizenid string
 ---@param gangName string
 ---@return boolean success
 ---@return ErrorResult? errorResult
-local function setPlayerPrimaryGang(citizenid, gangName)
+function SetPlayerPrimaryGang(citizenid, gangName)
     local player = GetPlayerByCitizenId(citizenid) or GetOfflinePlayer(citizenid)
     if not player then
         return false, {
             code = 'player_not_found',
-            message = string.format('player not found with citizenid %s', citizenid)
+            message = ('player not found with citizenid %s'):format(citizenid)
         }
     end
 
@@ -257,7 +411,7 @@ local function setPlayerPrimaryGang(citizenid, gangName)
     if not grade then
         return false, {
             code = 'player_not_in_gang',
-            message = string.format('player %s does not have gang %s', citizenid, gangName)
+            message = ('player %s does not have gang %s'):format(citizenid, gangName)
         }
     end
 
@@ -265,26 +419,28 @@ local function setPlayerPrimaryGang(citizenid, gangName)
     if not gang then
         return false, {
             code = 'gang_not_found',
-            message = gangName .. ' does not exist in core memory'
+            message = ('%s does not exist in core memory'):format(gangName)
         }
     end
 
-    assert(gang.grades[grade] ~= nil, string.format('gang %s does not have grade %s', gangName, grade))
+    assert(gang.grades[grade] ~= nil, ('gang %s does not have grade %s'):format(gangName, grade))
 
     player.PlayerData.gang = {
         name = gangName,
         label = gang.label,
         isboss = gang.grades[grade].isboss,
+        bankAuth = gang.grades[grade].bankAuth,
         grade = {
             name = gang.grades[grade].name,
             level = grade
         }
     }
 
-    player.Functions.Save()
-
-    if not player.Offline then
-        player.Functions.UpdatePlayerData()
+    if player.Offline then
+        SaveOffline(player.PlayerData)
+    else
+        Save(player.PlayerData.source)
+        UpdatePlayerData(player.PlayerData.source)
         TriggerEvent('QBCore:Server:OnGangUpdate', player.PlayerData.source, player.PlayerData.gang)
         TriggerClientEvent('QBCore:Client:OnGangUpdate', player.PlayerData.source, player.PlayerData.gang)
     end
@@ -292,15 +448,18 @@ local function setPlayerPrimaryGang(citizenid, gangName)
     return true
 end
 
-exports('SetPlayerPrimaryGang', setPlayerPrimaryGang)
+exports('SetPlayerPrimaryGang', SetPlayerPrimaryGang)
 
 ---Adds a player to the gang or overwrites their grade if already in the gang
 ---@param citizenid string
 ---@param gangName string
----@param grade integer
+---@param grade? integer
 ---@return boolean success
 ---@return ErrorResult? errorResult
 function AddPlayerToGang(citizenid, gangName, grade)
+    gangName = gangName:lower()
+    grade = tonumber(grade) or 0
+
     if gangName == 'none' then
         return false, {
             code = 'none',
@@ -312,14 +471,14 @@ function AddPlayerToGang(citizenid, gangName, grade)
     if not gang then
         return false, {
             code = 'gang_not_found',
-            message = gangName .. ' does not exist in core memory'
+            message = ('%s does not exist in core memory'):format(gangName)
         }
     end
 
     if not gang.grades[grade] then
         return false, {
             code = 'gang_missing_grade',
-            message = string.format('gang %s does not have grade %s', gangName, grade)
+            message = ('gang %s does not have grade %s'):format(gangName, grade)
         }
     end
 
@@ -327,7 +486,7 @@ function AddPlayerToGang(citizenid, gangName, grade)
     if not player then
         return false, {
             code = 'player_not_found',
-            message = string.format('player not found with citizenid %s', citizenid)
+            message = ('player not found with citizenid %s'):format(citizenid)
         }
     end
 
@@ -346,13 +505,13 @@ function AddPlayerToGang(citizenid, gangName, grade)
 
     if not player.Offline then
         player.PlayerData.gangs[gangName] = grade
-        player.Functions.SetPlayerData('gangs', player.PlayerData.gangs)
+        SetPlayerData(player.PlayerData.source, 'gangs', player.PlayerData.gangs)
         TriggerEvent('qbx_core:server:onGroupUpdate', player.PlayerData.source, gangName, grade)
         TriggerClientEvent('qbx_core:client:onGroupUpdate', player.PlayerData.source, gangName, grade)
     end
 
     if player.PlayerData.gang.name == gangName then
-        setPlayerPrimaryGang(citizenid, gangName)
+        SetPlayerPrimaryGang(citizenid, gangName)
     end
 
     return true
@@ -365,7 +524,7 @@ exports('AddPlayerToGang', AddPlayerToGang)
 ---@param gangName string
 ---@return boolean success
 ---@return ErrorResult? errorResult
-local function removePlayerFromGang(citizenid, gangName)
+function RemovePlayerFromGang(citizenid, gangName)
     if gangName == 'none' then
         return false, {
             code = 'none',
@@ -377,7 +536,7 @@ local function removePlayerFromGang(citizenid, gangName)
     if not player then
         return false, {
             code = 'player_not_found',
-            message = string.format('player not found with citizenid %s', citizenid)
+            message = ('player not found with citizenid %s'):format(citizenid)
         }
     end
 
@@ -395,16 +554,21 @@ local function removePlayerFromGang(citizenid, gangName)
             name = 'none',
             label = gang.label,
             isboss = false,
+            bankAuth = false,
             grade = {
                 name = gang.grades[0].name,
                 level = 0
             }
         }
-        player.Functions.Save()
+        if player.Offline then
+            SaveOffline(player.PlayerData)
+        else
+            Save(player.PlayerData.source)
+        end
     end
 
     if not player.Offline then
-        player.Functions.SetPlayerData('gangs', player.PlayerData.gangs)
+        SetPlayerData(player.PlayerData.source, 'gangs', player.PlayerData.gangs)
         TriggerEvent('qbx_core:server:onGroupUpdate', player.PlayerData.source, gangName)
         TriggerClientEvent('qbx_core:client:onGroupUpdate', player.PlayerData.source, gangName)
     end
@@ -412,13 +576,14 @@ local function removePlayerFromGang(citizenid, gangName)
     return true
 end
 
-exports('RemovePlayerFromGang', removePlayerFromGang)
+exports('RemovePlayerFromGang', RemovePlayerFromGang)
 
 ---@param source? integer if player is online
 ---@param playerData? PlayerEntity|PlayerData
 ---@return Player player
 function CheckPlayerData(source, playerData)
     playerData = playerData or {}
+    ---@diagnostic disable-next-line: param-type-mismatch
     local playerState = Player(source)?.state
     local Offline = true
     if source then
@@ -428,10 +593,10 @@ function CheckPlayerData(source, playerData)
         Offline = false
     end
 
+    playerData.userId = playerData.userId or nil
     playerData.citizenid = playerData.citizenid or GenerateUniqueIdentifier('citizenid')
     playerData.cid = playerData.charinfo?.cid or playerData.cid or 1
     playerData.money = playerData.money or {}
-    playerData.optin = playerData.optin or true
     for moneytype, startamount in pairs(config.money.moneyTypes) do
         playerData.money[moneytype] = playerData.money[moneytype] or startamount
     end
@@ -449,6 +614,7 @@ function CheckPlayerData(source, playerData)
     playerData.charinfo.cid = playerData.charinfo.cid or playerData.cid
     -- Metadata
     playerData.metadata = playerData.metadata or {}
+    playerData.metadata.optin = playerData.metadata.optin and true or false
     playerData.metadata.health = playerData.metadata.health or 200
     playerData.metadata.hunger = playerData.metadata.hunger or 100
     playerData.metadata.thirst = playerData.metadata.thirst or 100
@@ -506,6 +672,9 @@ function CheckPlayerData(source, playerData)
     local job = GetJob(playerData.job?.name) or GetJob('unemployed')
     assert(job ~= nil, 'Unemployed job not found. Does it exist in shared/jobs.lua?')
     local jobGrade = GetJob(playerData.job?.name) and playerData.job.grade.level or 0
+    if not job.grades[jobGrade] then
+        jobGrade = 0
+    end
 
     playerData.job = {
         name = playerData.job?.name or 'unemployed',
@@ -514,6 +683,7 @@ function CheckPlayerData(source, playerData)
         type = job.type,
         onduty = playerData.job?.onduty or false,
         isboss = job.grades[jobGrade].isboss or false,
+        bankAuth = job.grades[jobGrade].bankAuth or false,
         grade = {
             name = job.grades[jobGrade].name,
             level = jobGrade,
@@ -531,6 +701,7 @@ function CheckPlayerData(source, playerData)
         name = playerData.gang?.name or 'none',
         label = gang.label,
         isboss = gang.grades[gangGrade].isboss or false,
+        bankAuth = gang.grades[gangGrade].bankAuth or false,
         grade = {
             name = gang.grades[gangGrade].name,
             level = gangGrade
@@ -556,37 +727,16 @@ function Logout(source)
     TriggerEvent('QBCore:Server:OnPlayerUnload', source)
 
     player.PlayerData.lastLoggedOut = os.time()
-    player.Functions.Save()
+    Save(player.PlayerData.source)
 
     Wait(200)
     QBX.Players[source] = nil
     GlobalState.PlayerCount -= 1
     TriggerClientEvent('qbx_core:client:playerLoggedOut', source)
+    TriggerEvent('qbx_core:server:playerLoggedOut', source)
 end
 
 exports('Logout', Logout)
-
----@class Player
----@field Functions PlayerFunctions
----@field PlayerData PlayerData
----@field Offline boolean
-
----@class PlayerFunctions
----@field UpdatePlayerData fun()
----@field SetJob fun(job: string, grade: integer): boolean
----@field SetGang fun(gang: string, grade: integer): boolean
----@field SetJobDuty fun(onDuty: boolean)
----@field SetPlayerData fun(key: string, val: any)
----@field SetMetaData fun(meta: string, val: any)
----@field GetMetaData fun(meta: string): any
----@field AddJobReputation fun(amount: number)
----@field AddMoney fun(moneytype: MoneyType, amount: number, reason?: string): boolean
----@field RemoveMoney fun(moneytype: MoneyType, amount: number, reason?: string): boolean
----@field SetMoney fun(moneytype: MoneyType, amount: number, reason?: string): boolean
----@field GetMoney fun(moneytype: MoneyType): boolean | number
----@field SetCreditCard fun(cardNumber: number)
----@field Save fun()
----@field Logout fun()
 
 ---Create a new character
 ---Don't touch any of this unless you know what you are doing
@@ -600,108 +750,75 @@ function CreatePlayer(playerData, Offline)
     self.PlayerData = playerData
     self.Offline = Offline
 
+    ---@deprecated use UpdatePlayerData instead
     function self.Functions.UpdatePlayerData()
-        if self.Offline then return end -- Unsupported for Offline Players
-        TriggerEvent('QBCore:Player:SetPlayerData', self.PlayerData)
-        TriggerClientEvent('QBCore:Player:SetPlayerData', self.PlayerData.source, self.PlayerData)
+        if self.Offline then
+            lib.print.warn('UpdatePlayerData is unsupported for offline players')
+            return
+        end
+
+        UpdatePlayerData(self.PlayerData.source)
     end
 
+    ---@deprecated use SetJob instead
     ---Overwrites current primary job with a new job. Removing the player from their current primary job
     ---@param jobName string name
     ---@param grade? integer defaults to 0
     ---@return boolean success if job was set
+    ---@return ErrorResult? errorResult
     function self.Functions.SetJob(jobName, grade)
-        jobName = jobName:lower()
-        grade = grade or 0
-        local job = GetJob(jobName)
-        if not job then
-            lib.print.error(('cannot set job. Job %s does not exist'):format(jobName))
-            return false
-        end
-        if not job.grades[grade] then
-            lib.print.error(('cannot set job. Job %s does not have grade %s'):format(jobName, grade))
-            return false
-        end
-        if setJobReplaces then
-            RemovePlayerFromJob(self.PlayerData.citizenid, self.PlayerData.job.name)
-        end
-        AddPlayerToJob(self.PlayerData.citizenid, jobName, grade)
-        SetPlayerPrimaryJob(self.PlayerData.citizenid, jobName)
-        return true
+        return SetJob(self.PlayerData.source, jobName, grade)
     end
 
+    ---@deprecated use SetGang instead
     ---Removes the player from their current primary gang and adds the player to the new gang
     ---@param gangName string name
     ---@param grade? integer defaults to 0
     ---@return boolean success if gang was set
+    ---@return ErrorResult? errorResult
     function self.Functions.SetGang(gangName, grade)
-        gangName = gangName:lower()
-        grade = grade or 0
-        local gang = GetGang(gangName)
-        if not gang then
-            lib.print.error(('cannot set gang. Gang %s does not exist'):format(gangName))
-            return false
-        end
-        if not gang.grades[grade] then
-            lib.print.error(('cannot set gang. Gang %s does not have grade %s'):format(gangName, grade))
-            return false
-        end
-        if setGangReplaces then
-            removePlayerFromGang(self.PlayerData.citizenid, self.PlayerData.gang.name)
-        end
-        AddPlayerToGang(self.PlayerData.citizenid, gangName, grade)
-        setPlayerPrimaryGang(self.PlayerData.citizenid, gangName)
-        return true
+        return SetGang(self.PlayerData.source, gangName, grade)
     end
 
+    ---@deprecated use SetJobDuty instead
     ---@param onDuty boolean
     function self.Functions.SetJobDuty(onDuty)
-        self.PlayerData.job.onduty = not not onDuty -- Make sure the value is a boolean if nil is sent
-        TriggerEvent('QBCore:Server:SetDuty', self.PlayerData.source, self.PlayerData.job.onduty)
-        TriggerClientEvent('QBCore:Client:SetDuty', self.PlayerData.source, self.PlayerData.job.onduty)
-        self.Functions.UpdatePlayerData()
+        SetJobDuty(self.PlayerData.source, onDuty)
     end
 
+    ---@deprecated use SetPlayerData instead
     ---@param key string
     ---@param val any
     function self.Functions.SetPlayerData(key, val)
-        if not key or type(key) ~= 'string' then return end
-        self.PlayerData[key] = val
-        self.Functions.UpdatePlayerData()
+        SetPlayerData(self.PlayerData.source, key, val)
     end
 
+    ---@deprecated use SetMetadata instead
     ---@param meta string
     ---@param val any
     function self.Functions.SetMetaData(meta, val)
-        if not meta or type(meta) ~= 'string' then return end
-        if (meta == 'hunger' or meta == 'thirst' or meta == 'stress') and self.PlayerData.source then
-            val = lib.math.clamp(val, 0, 100)
-            Player(self.PlayerData.source).state:set(meta, val, true)
-        end
-
-        local oldVal = self.PlayerData.metadata[meta]
-        self.PlayerData.metadata[meta] = val
-        self.Functions.UpdatePlayerData()
-        if meta == 'inlaststand' or meta == 'isdead' then
-            self.Functions.Save()
-        end
-        TriggerClientEvent('qbx_core:client:onSetMetaData', self.PlayerData.source, meta, oldVal, val)
-        TriggerEvent('qbx_core:server:onSetMetaData', meta,  oldVal, val, self.PlayerData.source)
+        SetMetadata(self.PlayerData.source, meta, val)
     end
 
+    ---@deprecated use GetMetadata instead
     ---@param meta string
     ---@return any
     function self.Functions.GetMetaData(meta)
-        if not meta or type(meta) ~= 'string' then return end
-        return self.PlayerData.metadata[meta]
+        return GetMetadata(self.PlayerData.source, meta)
     end
 
+    ---@deprecated use SetMetadata instead
     ---@param amount number
     function self.Functions.AddJobReputation(amount)
         if not amount then return end
+
         amount = tonumber(amount) --[[@as number]]
-        self.PlayerData.metadata.jobrep[self.PlayerData.job.name] = self.PlayerData.metadata.jobrep[self.PlayerData.job.name] + amount
-        self.Functions.UpdatePlayerData()
+
+        local existingAmount = self.PlayerData.metadata.jobrep[self.PlayerData.job.name]
+        self.PlayerData.metadata.jobrep[self.PlayerData.job.name] = existingAmount + amount
+
+        ---@diagnostic disable-next-line: param-type-mismatch
+        UpdatePlayerData(self.Offline and self.PlayerData.citizenid or self.PlayerData.source)
     end
 
     ---@param moneytype MoneyType
@@ -709,31 +826,7 @@ function CreatePlayer(playerData, Offline)
     ---@param reason? string
     ---@return boolean success if money was added
     function self.Functions.AddMoney(moneytype, amount, reason)
-        reason = reason or 'unknown'
-        amount = qbx.math.round(tonumber(amount) --[[@as number]])
-        if amount < 0 then return false end
-        if not self.PlayerData.money[moneytype] then return false end
-        self.PlayerData.money[moneytype] = self.PlayerData.money[moneytype] + amount
-
-        if not self.Offline then
-            self.Functions.UpdatePlayerData()
-            local tags = amount > 100000 and config.logging.role or nil
-            local resource = GetInvokingResource() or cache.resource
-            logger.log({
-                source = resource,
-                webhook = config.logging.webhook['playermoney'],
-                event = 'AddMoney',
-                color = 'lightgreen',
-                tags = tags,
-                message = ('**%s (citizenid: %s | id: %s)** $%s (%s) added, new %s balance: $%s reason: %s'):format(GetPlayerName(self.PlayerData.source), self.PlayerData.citizenid, self.PlayerData.source, amount, moneytype, moneytype, self.PlayerData.money[moneytype], reason),
-                --oxLibTags = ('script:%s,playerName:%s,citizenId:%s,playerSource:%s,amount:%s,moneyType:%s,newBalance:%s,reason:%s'):format(resource, GetPlayerName(self.PlayerData.source), self.PlayerData.citizenid, self.PlayerData.source, amount, moneytype, self.PlayerData.money[moneytype], reason)
-            })
-            TriggerClientEvent('hud:client:OnMoneyChange', self.PlayerData.source, moneytype, amount, false)
-            TriggerClientEvent('QBCore:Client:OnMoneyChange', self.PlayerData.source, moneytype, amount, 'add', reason)
-            TriggerEvent('QBCore:Server:OnMoneyChange', self.PlayerData.source, moneytype, amount, 'add', reason)
-        end
-
-        return true
+        return AddMoney(self.PlayerData.source, moneytype, amount, reason)
     end
 
     ---@param moneytype MoneyType
@@ -741,41 +834,7 @@ function CreatePlayer(playerData, Offline)
     ---@param reason? string
     ---@return boolean success if money was removed
     function self.Functions.RemoveMoney(moneytype, amount, reason)
-        reason = reason or 'unknown'
-        amount = qbx.math.round(tonumber(amount) --[[@as number]])
-        if amount < 0 then return false end
-        if not self.PlayerData.money[moneytype] then return false end
-        for _, mtype in pairs(config.money.dontAllowMinus) do
-            if mtype == moneytype then
-                if (self.PlayerData.money[moneytype] - amount) < 0 then
-                    return false
-                end
-            end
-        end
-        self.PlayerData.money[moneytype] = self.PlayerData.money[moneytype] - amount
-
-        if not self.Offline then
-            self.Functions.UpdatePlayerData()
-            local tags = amount > 100000 and config.logging.role or nil
-            local resource = GetInvokingResource() or cache.resource
-            logger.log({
-                source = resource,
-                webhook = config.logging.webhook['playermoney'],
-                event = 'RemoveMoney',
-                color = 'red',
-                tags = tags,
-                message = ('** %s (citizenid: %s | id: %s)** $%s (%s) removed, new %s balance: $%s reason: %s'):format(GetPlayerName(self.PlayerData.source), self.PlayerData.citizenid, self.PlayerData.source, amount, moneytype, moneytype, self.PlayerData.money[moneytype], reason),
-                --oxLibTags = ('script:%s,playerName:%s,citizenId:%s,playerSource:%s,amount:%s,moneyType:%s,newBalance:%s,reason:%s'):format(resource, GetPlayerName(self.PlayerData.source), self.PlayerData.citizenid, self.PlayerData.source, amount, moneytype, self.PlayerData.money[moneytype], reason)
-            })
-            TriggerClientEvent('hud:client:OnMoneyChange', self.PlayerData.source, moneytype, amount, true)
-            if moneytype == 'bank' then
-                TriggerClientEvent('qb-phone:client:RemoveBankMoney', self.PlayerData.source, amount)
-            end
-            TriggerClientEvent('QBCore:Client:OnMoneyChange', self.PlayerData.source, moneytype, amount, 'remove', reason)
-            TriggerEvent('QBCore:Server:OnMoneyChange', self.PlayerData.source, moneytype, amount, 'remove', reason)
-        end
-
-        return true
+        return RemoveMoney(self.PlayerData.source, moneytype, amount, reason)
     end
 
     ---@param moneytype MoneyType
@@ -783,49 +842,96 @@ function CreatePlayer(playerData, Offline)
     ---@param reason? string
     ---@return boolean success if money was set
     function self.Functions.SetMoney(moneytype, amount, reason)
-        reason = reason or 'unknown'
-        amount = qbx.math.round(tonumber(amount) --[[@as number]])
-        if amount < 0 then return false end
-        if not self.PlayerData.money[moneytype] then return false end
-        local difference = amount - self.PlayerData.money[moneytype]
-        self.PlayerData.money[moneytype] = amount
-
-        if not self.Offline then
-            self.Functions.UpdatePlayerData()
-            local dirChange = difference < 0 and 'added' or 'removed'
-            local absDifference = math.abs(difference)
-            local tags = absDifference > 50000 and config.logging.role or {}
-            local resource = GetInvokingResource() or cache.resource
-            logger.log({
-                source = resource,
-                webhook = config.logging.webhook['playermoney'],
-                event = 'SetMoney',
-                color = difference < 0 and 'green' or 'red',
-                tags = tags,
-                message = ('**%s (citizenid: %s | id: %s)** $%s (%s) %s, new %s balance: $%s reason: %s'):format(GetPlayerName(self.PlayerData.source), self.PlayerData.citizenid, self.PlayerData.source, absDifference, moneytype, dirChange, moneytype, self.PlayerData.money[moneytype], reason),
-                --oxLibTags = ('script:%s,playerName:%s,citizenId:%s,playerSource:%s,amount:%s,moneyType:%s,newBalance:%s,reason:%s,direction:%s'):format(resource, GetPlayerName(self.PlayerData.source), self.PlayerData.citizenid, self.PlayerData.source, absDifference, moneytype, self.PlayerData.money[moneytype], reason, dirChange)
-            })
-            TriggerClientEvent('hud:client:OnMoneyChange', self.PlayerData.source, moneytype, absDifference, difference < 0)
-            TriggerClientEvent('QBCore:Client:OnMoneyChange', self.PlayerData.source, moneytype, amount, 'set', reason)
-            TriggerEvent('QBCore:Server:OnMoneyChange', self.PlayerData.source, moneytype, amount, 'set', reason)
-        end
-
-        return true
+        return SetMoney(self.PlayerData.source, moneytype, amount, reason)
     end
 
     ---@param moneytype MoneyType
     ---@return boolean | number amount or false if moneytype does not exist
     function self.Functions.GetMoney(moneytype)
-        if not moneytype then return false end
-        return self.PlayerData.money[moneytype]
+        return GetMoney(self.PlayerData.source, moneytype)
     end
 
+    local function qbItemCompat(item)
+        if not item then return end
+
+        item.info = item.metadata
+        item.amount = item.count
+
+        return item
+    end
+
+    ---@param item string
+    ---@return string
+    local function oxItemCompat(item)
+        return item == 'cash' and 'money' or item
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    ---@param item string
+    ---@param amount number
+    ---@param metadata? table
+    ---@param slot? number
+    ---@return boolean success
+    function self.Functions.AddItem(item, amount, slot, metadata)
+        assert(not self.Offline, 'unsupported for offline players')
+        return exports.ox_inventory:AddItem(self.PlayerData.source, oxItemCompat(item), amount, metadata, slot)
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    ---@param item string
+    ---@param amount number
+    ---@param slot? number
+    ---@return boolean success
+    function self.Functions.RemoveItem(item, amount, slot)
+        assert(not self.Offline, 'unsupported for offline players')
+        return exports.ox_inventory:RemoveItem(self.PlayerData.source, oxItemCompat(item), amount, nil, slot)
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    ---@param slot number
+    ---@return any table
+    function self.Functions.GetItemBySlot(slot)
+        assert(not self.Offline, 'unsupported for offline players')
+        return qbItemCompat(exports.ox_inventory:GetSlot(self.PlayerData.source, slot))
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    ---@param itemName string
+    ---@return any table
+    function self.Functions.GetItemByName(itemName)
+        assert(not self.Offline, 'unsupported for offline players')
+        return qbItemCompat(exports.ox_inventory:GetSlotWithItem(self.PlayerData.source, oxItemCompat(itemName)))
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    ---@param itemName string
+    ---@return any table
+    function self.Functions.GetItemsByName(itemName)
+        assert(not self.Offline, 'unsupported for offline players')
+        return qbItemCompat(exports.ox_inventory:GetSlotsWithItem(self.PlayerData.source, oxItemCompat(itemName)))
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    function self.Functions.ClearInventory()
+        assert(not self.Offline, 'unsupported for offline players')
+        return exports.ox_inventory:ClearInventory(self.PlayerData.source)
+    end
+
+    ---@deprecated use ox_inventory exports directly
+    function self.Functions.SetInventory()
+        error('Player.Functions.SetInventory is unsupported for ox_inventory. Try ClearInventory, then add the desired items.')
+    end
+
+    ---@deprecated use SetCharInfo instead
     ---@param cardNumber number
     function self.Functions.SetCreditCard(cardNumber)
         self.PlayerData.charinfo.card = cardNumber
-        self.Functions.UpdatePlayerData()
+
+        ---@diagnostic disable-next-line: param-type-mismatch
+        UpdatePlayerData(self.Offline and self.PlayerData.citizenid or self.PlayerData.source)
     end
 
+    ---@deprecated use Save or SaveOffline instead
     function self.Functions.Save()
         if self.Offline then
             SaveOffline(self.PlayerData)
@@ -836,34 +942,49 @@ function CreatePlayer(playerData, Offline)
 
     ---@deprecated call exports.qbx_core:Logout(source)
     function self.Functions.Logout()
-        if self.Offline then return end -- Unsupported for Offline Players
+        assert(not self.Offline, 'unsupported for offline players')
         Logout(self.PlayerData.source)
     end
 
     AddEventHandler('qbx_core:server:onJobUpdate', function(jobName, job)
         if self.PlayerData.job.name ~= jobName then return end
+
         if not job then
-            self.Functions.setJob('unemployed', 0)
-            return
-        end
-        self.PlayerData.job.label = job.label
-        self.PlayerData.job.type = job.type or 'none'
-        local jobGrade = job.grades[self.PlayerData.job.grade.level]
-        if jobGrade then
-            self.PlayerData.job.grade.name = jobGrade.name
-            self.PlayerData.job.payment = jobGrade.payment or 30
-            self.PlayerData.job.isboss = jobGrade.isboss or false
-        else
-            self.PlayerData.job.grade = {
-                name = 'No Grades',
-                level = 0,
-                payment = 30,
+            self.PlayerData.job = {
+                name = 'unemployed',
+                label = 'Civilian',
                 isboss = false,
+                bankAuth = false,
+                onduty = true,
+                payment = 10,
+                grade = {
+                    name = 'Freelancer',
+                    level = 0,
+                }
             }
+        else
+            self.PlayerData.job.label = job.label
+            self.PlayerData.job.type = job.type or 'none'
+
+            local jobGrade = job.grades[self.PlayerData.job.grade.level]
+
+            if jobGrade then
+                self.PlayerData.job.grade.name = jobGrade.name
+                self.PlayerData.job.payment = jobGrade.payment or 30
+                self.PlayerData.job.isboss = jobGrade.isboss or false
+                self.PlayerData.job.bankAuth = jobGrade.bankAuth or false
+            else
+                self.PlayerData.job.grade = {
+                    name = 'No Grades',
+                    level = 0,
+                    payment = 30,
+                    isboss = false,
+                }
+            end
         end
 
         if not self.Offline then
-            self.Functions.UpdatePlayerData()
+            UpdatePlayerData(self.PlayerData.source)
             TriggerEvent('QBCore:Server:OnJobUpdate', self.PlayerData.source, self.PlayerData.job)
             TriggerClientEvent('QBCore:Client:OnJobUpdate', self.PlayerData.source, self.PlayerData.job)
         end
@@ -871,11 +992,13 @@ function CreatePlayer(playerData, Offline)
 
     AddEventHandler('qbx_core:server:onGangUpdate', function(gangName, gang)
         if self.PlayerData.gang.name ~= gangName then return end
+
         if not gang then
             self.PlayerData.gang = {
                 name = 'none',
                 label = 'No Gang Affiliation',
                 isboss = false,
+                bankAuth = false,
                 grade = {
                     name = 'none',
                     level = 0
@@ -883,19 +1006,25 @@ function CreatePlayer(playerData, Offline)
             }
         else
             self.PlayerData.gang.label = gang.label
+
             local gangGrade = gang.grades[self.PlayerData.gang.grade.level]
+
             if gangGrade then
+                self.PlayerData.gang.grade.name = gangGrade.name
                 self.PlayerData.gang.isboss = gangGrade.isboss or false
+                self.PlayerData.gang.bankAuth = gangGrade.bankAuth or false
             else
                 self.PlayerData.gang.grade = {
                     name = 'No Grades',
                     level = 0,
                 }
                 self.PlayerData.gang.isboss = false
+                self.PlayerData.gang.bankAuth = false
             end
         end
+
         if not self.Offline then
-            self.Functions.UpdatePlayerData()
+            UpdatePlayerData(self.PlayerData.source)
             TriggerEvent('QBCore:Server:OnGangUpdate', self.PlayerData.source, self.PlayerData.gang)
             TriggerClientEvent('QBCore:Client:OnGangUpdate', self.PlayerData.source, self.PlayerData.gang)
         end
@@ -908,7 +1037,8 @@ function CreatePlayer(playerData, Offline)
         SetPedArmour(ped, self.PlayerData.metadata.armor)
         -- At this point we are safe to emit new instance to third party resource for load handling
         GlobalState.PlayerCount += 1
-        self.Functions.UpdatePlayerData()
+        UpdatePlayerData(self.PlayerData.source)
+        Player(self.PlayerData.source).state:set('loadInventory', true, true)
         TriggerEvent('QBCore:Server:PlayerLoaded', self)
     end
 
@@ -973,24 +1103,392 @@ end
 
 exports('SaveOffline', SaveOffline)
 
+---@param identifier Source | string
+---@param key string
+---@param value any
+function SetPlayerData(identifier, key, value)
+    if type(key) ~= 'string' then return end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return end
+
+    player.PlayerData[key] = value
+
+    UpdatePlayerData(identifier)
+end
+
+exports('SetPlayerData', SetPlayerData)
+
+---@param identifier Source | string
+function UpdatePlayerData(identifier)
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player or player.Offline then return end
+
+    TriggerEvent('QBCore:Player:SetPlayerData', player.PlayerData)
+    TriggerClientEvent('QBCore:Player:SetPlayerData', player.PlayerData.source, player.PlayerData)
+end
+
+exports('UpdatePlayerData', UpdatePlayerData)
+
+---@param identifier Source | string
+---@param metadata string
+---@param value any
+function SetMetadata(identifier, metadata, value)
+    if type(metadata) ~= 'string' then return end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return end
+
+    local numeric = numericMetadata[metadata]
+    if numeric then
+        value = tonumber(value)
+        if not qbx.math.isFinite(value) then
+            lib.print.warn(('rejected non-finite value for metadata "%s"'):format(metadata))
+            return
+        end
+        value = lib.math.clamp(value, numeric.min, numeric.max)
+    end
+
+    local oldValue
+
+    if metadata:match('%.') then
+        local metaTable, metaKey = metadata:match('([^%.]+)%.(.+)')
+
+        if metaKey:match('%.') then
+            lib.print.error('cannot set nested metadata more than 1 level deep')
+            return
+        end
+
+        local nested = player.PlayerData.metadata[metaTable]
+        if type(nested) ~= 'table' then
+            lib.print.error(('cannot set nested metadata, %s is not a table'):format(metaTable))
+            return
+        end
+
+        oldValue = nested[metaKey]
+        nested[metaKey] = value
+
+        metadata = metaTable
+    else
+        oldValue = player.PlayerData.metadata[metadata]
+
+        player.PlayerData.metadata[metadata] = value
+    end
+
+    UpdatePlayerData(identifier)
+
+    if not player.Offline then
+        local playerState = Player(player.PlayerData.source).state
+
+        TriggerClientEvent('qbx_core:client:onSetMetaData', player.PlayerData.source, metadata, oldValue, value)
+        TriggerEvent('qbx_core:server:onSetMetaData', metadata,  oldValue, value, player.PlayerData.source)
+
+        if numericMetadata[metadata] then
+            if playerState[metadata] ~= value then
+                playerState:set(metadata, value, true)
+            end
+        end
+
+        if (metadata == 'isdead' or metadata == 'inlaststand') then
+            playerState:set('canUseWeapons', not value, true)
+        end
+    end
+
+    if metadata == 'inlaststand' or metadata == 'isdead' then
+        if player.Offline then
+            SaveOffline(player.PlayerData)
+        else
+            Save(player.PlayerData.source)
+        end
+    end
+end
+
+exports('SetMetadata', SetMetadata)
+
+---@param identifier Source | string
+---@param metadata string
+---@return any
+function GetMetadata(identifier, metadata)
+    if type(metadata) ~= 'string' then return end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return end
+
+    if metadata:match('%.') then
+        local metaTable, metaKey = metadata:match('([^%.]+)%.(.+)')
+
+        if metaKey:match('%.') then
+            lib.print.error('cannot get nested metadata more than 1 level deep')
+            return
+        end
+
+        local nested = player.PlayerData.metadata[metaTable]
+        if type(nested) ~= 'table' then return end
+
+        return nested[metaKey]
+    else
+        return player.PlayerData.metadata[metadata]
+    end
+end
+
+exports('GetMetadata', GetMetadata)
+
+---@param identifier Source | string
+---@param charInfo string
+---@param value any
+function SetCharInfo(identifier, charInfo, value)
+    if type(charInfo) ~= 'string' then return end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return end
+
+    --local oldCharInfo = player.PlayerData.charinfo[charInfo]
+
+    player.PlayerData.charinfo[charInfo] = value
+
+    UpdatePlayerData(identifier)
+end
+
+exports('SetCharInfo', SetCharInfo)
+
+---@param source Source
+---@param playerMoney table
+---@param moneyType MoneyType
+---@param amount number
+---@param actionType 'add' | 'remove' | 'set'
+---@param reason? string
+---@param difference? number
+local function emitMoneyEvents(source, playerMoney, moneyType, amount, actionType, reason, difference)
+    local isSet = actionType == 'set'
+    local isRemove = actionType == 'remove'
+
+    TriggerClientEvent('hud:client:OnMoneyChange', source, moneyType, isSet and math.abs(difference) or amount, isSet and difference < 0 or isRemove, reason)
+    TriggerClientEvent('QBCore:Client:OnMoneyChange', source, moneyType, amount, actionType, reason)
+    TriggerEvent('QBCore:Server:OnMoneyChange', source, moneyType, amount, actionType, reason)
+
+    if moneyType == 'bank' and isRemove then
+        TriggerClientEvent('qb-phone:client:RemoveBankMoney', source, amount)
+    end
+
+    local oxMoneyType = moneyType == 'cash' and 'money' or moneyType
+
+    if accountsAsItems[oxMoneyType] then
+        exports.ox_inventory:SetItem(source, oxMoneyType, playerMoney[moneyType])
+    end
+end
+
+---@param value unknown
+---@return number?
+local function validateMoneyAmount(value)
+    value = tonumber(value)
+    if not qbx.math.isFinite(value) then return end
+    value = qbx.math.round(value)
+    if value < 0 then return end
+    return value
+end
+
+---@param identifier Source | string
+---@param moneyType MoneyType
+---@param amount number
+---@param reason? string
+---@return boolean success if money was added
+function AddMoney(identifier, moneyType, amount, reason)
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return false end
+
+    reason = reason or 'unknown'
+    local validAmount = validateMoneyAmount(amount)
+
+    if not validAmount or not player.PlayerData.money[moneyType] then return false end
+
+    amount = validAmount
+
+    if not triggerEventHooks('addMoney', {
+        source = player.PlayerData.source,
+        moneyType = moneyType,
+        amount = amount
+    }) then return false end
+
+    player.PlayerData.money[moneyType] += amount
+
+    if player.Offline then
+        SaveOffline(player.PlayerData)
+    else
+        UpdatePlayerData(identifier)
+
+        local tags = amount > 100000 and config.logging.role or nil
+        local resource = GetInvokingResource() or cache.resource
+
+        logger.log({
+            source = resource,
+            webhook = config.logging.webhook['playermoney'],
+            event = 'AddMoney',
+            color = 'lightgreen',
+            tags = tags,
+            message = ('**%s (citizenid: %s | id: %s)** $%s (%s) added, new %s balance: $%s reason: %s'):format(GetPlayerName(player.PlayerData.source), player.PlayerData.citizenid, player.PlayerData.source, amount, moneyType, moneyType, player.PlayerData.money[moneyType], reason),
+            --oxLibTags = ('script:%s,playerName:%s,citizenId:%s,playerSource:%s,amount:%s,moneyType:%s,newBalance:%s,reason:%s'):format(resource, GetPlayerName(player.PlayerData.source), player.PlayerData.citizenid, player.PlayerData.source, amount, moneyType, player.PlayerData.money[moneyType], reason)
+        })
+
+        emitMoneyEvents(player.PlayerData.source, player.PlayerData.money, moneyType, amount, 'add', reason)
+    end
+
+    return true
+end
+
+exports('AddMoney', AddMoney)
+
+---@param identifier Source | string
+---@param moneyType MoneyType
+---@param amount number
+---@param reason? string
+---@return boolean success if money was removed
+function RemoveMoney(identifier, moneyType, amount, reason)
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return false end
+
+    reason = reason or 'unknown'
+    local validAmount = validateMoneyAmount(amount)
+
+    if not validAmount or not player.PlayerData.money[moneyType] then return false end
+
+    amount = validAmount
+
+    if not triggerEventHooks('removeMoney', {
+        source = player.PlayerData.source,
+        moneyType = moneyType,
+        amount = amount
+    }) then return false end
+
+    for _, mType in pairs(config.money.dontAllowMinus) do
+        if mType == moneyType then
+            if (player.PlayerData.money[moneyType] - amount) < 0 then
+                return false
+            end
+        end
+    end
+
+    player.PlayerData.money[moneyType] -= amount
+
+    if player.Offline then
+        SaveOffline(player.PlayerData)
+    else
+        UpdatePlayerData(identifier)
+
+        local tags = amount > 100000 and config.logging.role or nil
+        local resource = GetInvokingResource() or cache.resource
+
+        logger.log({
+            source = resource,
+            webhook = config.logging.webhook['playermoney'],
+            event = 'RemoveMoney',
+            color = 'red',
+            tags = tags,
+            message = ('** %s (citizenid: %s | id: %s)** $%s (%s) removed, new %s balance: $%s reason: %s'):format(GetPlayerName(player.PlayerData.source), player.PlayerData.citizenid, player.PlayerData.source, amount, moneyType, moneyType, player.PlayerData.money[moneyType], reason),
+            --oxLibTags = ('script:%s,playerName:%s,citizenId:%s,playerSource:%s,amount:%s,moneyType:%s,newBalance:%s,reason:%s'):format(resource, GetPlayerName(player.PlayerData.source), player.PlayerData.citizenid, player.PlayerData.source, amount, moneyType, player.PlayerData.money[moneyType], reason)
+        })
+
+        emitMoneyEvents(player.PlayerData.source, player.PlayerData.money, moneyType, amount, 'remove', reason)
+    end
+
+    return true
+end
+
+exports('RemoveMoney', RemoveMoney)
+
+---@param identifier Source | string
+---@param moneyType MoneyType
+---@param amount number
+---@param reason? string
+---@return boolean success if money was set
+function SetMoney(identifier, moneyType, amount, reason)
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return false end
+
+    reason = reason or 'unknown'
+    local validAmount = validateMoneyAmount(amount)
+    local oldAmount = player.PlayerData.money[moneyType]
+
+    if not validAmount or not oldAmount then return false end
+
+    amount = validAmount
+
+    if not triggerEventHooks('setMoney', {
+        source = player.PlayerData.source,
+        moneyType = moneyType,
+        amount = amount
+    }) then return false end
+
+    player.PlayerData.money[moneyType] = amount
+
+    if player.Offline then
+        SaveOffline(player.PlayerData)
+    else
+        UpdatePlayerData(identifier)
+
+        local difference = amount - oldAmount
+        local dirChange = difference < 0 and 'removed' or 'added'
+        local absDifference = math.abs(difference)
+        local tags = absDifference > 50000 and config.logging.role or {}
+        local resource = GetInvokingResource() or cache.resource
+
+        logger.log({
+            source = resource,
+            webhook = config.logging.webhook['playermoney'],
+            event = 'SetMoney',
+            color = difference < 0 and 'red' or 'green',
+            tags = tags,
+            message = ('**%s (citizenid: %s | id: %s)** $%s (%s) %s, new %s balance: $%s reason: %s'):format(GetPlayerName(player.PlayerData.source), player.PlayerData.citizenid, player.PlayerData.source, absDifference, moneyType, dirChange, moneyType, player.PlayerData.money[moneyType], reason),
+        })
+
+        emitMoneyEvents(player.PlayerData.source, player.PlayerData.money, moneyType, amount, 'set', reason, difference)
+    end
+
+    return true
+end
+
+exports('SetMoney', SetMoney)
+
+---@param identifier Source | string
+---@param moneyType MoneyType
+---@return boolean | number amount or false if moneytype does not exist
+function GetMoney(identifier, moneyType)
+    if not moneyType then return false end
+
+    local player = type(identifier) == 'string' and (GetPlayerByCitizenId(identifier) or GetOfflinePlayer(identifier)) or GetPlayer(identifier)
+
+    if not player then return false end
+
+    return player.PlayerData.money[moneyType]
+end
+
+exports('GetMoney', GetMoney)
+
 ---@param source Source
 ---@param citizenid string
+---@return boolean success
 function DeleteCharacter(source, citizenid)
     local license, license2 = GetPlayerIdentifierByType(source --[[@as string]], 'license'), GetPlayerIdentifierByType(source --[[@as string]], 'license2')
-    local result = storage.fetchPlayerEntity(citizenid).license
+    local result, success = storage.fetchPlayerEntity(citizenid)?.license, false
+
     if license == result or license2 == result then
-        CreateThread(function()
-            local success = storage.deletePlayer(citizenid)
-            if success then
-                logger.log({
-                    source = 'qbx_core',
-                    webhook = config.logging.webhook['joinleave'],
-                    event = 'Character Deleted',
-                    color = 'red',
-                    message = ('**%s** deleted **%s**...'):format(GetPlayerName(source), citizenid, source),
-                })
-            end
-        end)
+        success = storage.deletePlayer(citizenid)
+        if success then
+            logger.log({
+                source = 'qbx_core',
+                webhook = config.logging.webhook['joinleave'],
+                event = 'Character Deleted',
+                color = 'red',
+                message = ('**%s** deleted **%s**...'):format(GetPlayerName(source), citizenid, source),
+            })
+        end
     else
         DropPlayer(tostring(source), locale('info.exploit_dropped'))
         logger.log({
@@ -1002,7 +1500,11 @@ function DeleteCharacter(source, citizenid)
             message = ('%s has been dropped for character deleting exploit'):format(GetPlayerName(source)),
         })
     end
+
+    return success
 end
+
+lib.callback.register('qbx_core:server:deleteCharacter', DeleteCharacter)
 
 ---@param citizenid string
 function ForceDeleteCharacter(citizenid)

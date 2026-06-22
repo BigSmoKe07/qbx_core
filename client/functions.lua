@@ -6,7 +6,7 @@ local positionConfig = require 'config.shared'.notifyPosition
 ---@param duration? integer milliseconds notification will remain on screen. Defaults to 5000
 ---@param subTitle? string extra text under the title
 ---@param notifyPosition? NotificationPosition
----@param notifyStyle? table Custom styling. Please refer too https://overextended.dev/ox_lib/Modules/Interface/Client/notify#libnotify
+---@param notifyStyle? table Custom styling. Please refer too https://coxdocs.dev/ox_lib/Modules/Interface/Client/notify#libnotify
 ---@param notifyIcon? string Font Awesome 6 icon name
 ---@param notifyIconColor? string Custom color for the icon chosen before
 function Notify(text, notifyType, duration, subTitle, notifyPosition, notifyStyle, notifyIcon, notifyIconColor)
@@ -47,7 +47,23 @@ exports('GetPlayerData', GetPlayerData)
 ---@param filter string | string[] | table<string, number>
 ---@return boolean
 function HasPrimaryGroup(filter)
-    return HasPlayerGotGroup(filter, QBX.PlayerData)
+    return HasPlayerGotGroup(filter, QBX.PlayerData, true)
 end
 
 exports('HasPrimaryGroup', HasPrimaryGroup)
+
+---@param filter string | string[] | table<string, number>
+---@return boolean
+function HasGroup(filter)
+    return HasPlayerGotGroup(filter, QBX.PlayerData)
+end
+
+exports('HasGroup', HasGroup)
+
+---@return table<string, integer>
+function GetGroups()
+    local playerData = QBX.PlayerData
+    return GetPlayerGroups(playerData)
+end
+
+exports('GetGroups', GetGroups)

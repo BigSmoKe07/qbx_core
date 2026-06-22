@@ -1,3 +1,5 @@
+---@diagnostic disable: deprecated
+
 lib.print.warn('This resource is still using the deprecated qbx_core utils!')
 lib.print.warn('If you are the author, please update to use the new lib module. If you are not, please tell them to update!')
 
@@ -141,18 +143,20 @@ if isServer then
     ---@param model string | integer
     ---@param coords? vector4 defaults to player's position
     ---@param warp? boolean
-    ---@param props? table vehicle properties to set https://github.com/overextended/ox_lib/blob/master/resource/vehicleProperties/client.lua#L3
+    ---@param props? table vehicle properties to set https://coxdocs.dev/ox_lib/Modules/VehicleProperties/Client#vehicle-properties
     ---@return integer? netId
     function SpawnVehicle(source, model, coords, warp, props) -- luacheck: ignore
         model = type(model) == 'string' and joaat(model) or (model --[[@as integer]])
         local ped = GetPlayerPed(source)
 
-        return qbx.spawnVehicle({
+        local netId, _ = qbx.spawnVehicle({
             model = model,
             spawnSource = coords or ped,
             warp = warp and ped or nil,
             props = props,
         })
+
+        return netId
     end
 
 
@@ -211,7 +215,7 @@ if isServer then
         return false
     end
 
-    ---@deprecated use https://overextended.dev/ox_inventory/Functions/Server#search
+    ---@deprecated use https://coxdocs.dev/ox_inventory/Functions/Server#search
     ---@param source Source
     ---@param items string | string[] The item(s) to check for. Can be a string or a table and is mandatory.
     ---@param amount? integer The desired quantity of each item. Acceptable to pass nil, will default to 1.
@@ -292,7 +296,7 @@ else
         return qbx.entityStateHandler(keyFilter, cb)
     end
 
-    ---@deprecated use https://overextended.dev/ox_inventory/Functions/Client#search
+    ---@deprecated use https://coxdocs.dev/ox_inventory/Functions/Client#search
     ---@param items string | string[] The item(s) to check for. Can be a string or a table and is mandatory.
     ---@param amount? integer The desired quantity of each item. Acceptable to pass nil, will default to 1.
     ---@return boolean Returns true if the player has the specified items in the desired quantity, false otherwise

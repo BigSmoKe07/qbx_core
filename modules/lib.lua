@@ -4,6 +4,7 @@ local qbx = {}
 qbx.string = {}
 qbx.math = {}
 qbx.table = {}
+qbx.array = {}
 
 qbx.armsWithoutGloves = lib.table.freeze({
     male = lib.table.freeze({
@@ -88,6 +89,37 @@ qbx.armsWithoutGloves = lib.table.freeze({
     }),
 })
 
+
+qbx.duffelbagIndexes = lib.table.freeze({
+    male = lib.table.freeze({
+        [40] = true,
+        [41] = true,
+        [44] = true,
+        [45] = true,
+        [81] = true,
+        [82] = true,
+        [85] = true,
+        [86] = true,
+        [130] = true,
+        [131] = true,
+        [132] = true
+    }),
+    female = lib.table.freeze({
+        [40] = true,
+        [41] = true,
+        [44] = true,
+        [45] = true,
+        [81] = true,
+        [82] = true,
+        [85] = true,
+        [86] = true,
+        [131] = true,
+        [132] = true,
+        [133] = true
+    })
+})
+
+
 ---Returns the given string with its trailing whitespaces removed.
 ---@param str string
 ---@return string
@@ -112,6 +144,13 @@ function qbx.math.round(num, decimalPlaces)
     if not decimalPlaces then return math.floor(num + 0.5) end
     local power = 10 ^ decimalPlaces
     return math.floor((num * power) + 0.5) / power
+end
+
+---Returns whether the given value is a finite number (not nil, NaN or infinity).
+---@param value any
+---@return boolean
+function qbx.math.isFinite(value)
+    return type(value) == 'number' and value == value and value ~= math.huge and value ~= -math.huge
 end
 
 ---Returns the number of items in a table. Useful for non-array tables.
@@ -147,6 +186,21 @@ function qbx.table.mapBySubfield(tble, subfield)
     return map
 end
 
+---Returns true if the given array contains the given value.
+---@generic T
+---@param arr T[]
+---@param val T
+---@return boolean
+function qbx.array.contains(arr, val)
+    for i = 1, #arr do
+        if arr[i] == val then
+            return true
+        end
+    end
+
+    return false
+end
+
 ---Returns the number plate of the given vehicle.
 ---@param vehicle integer
 ---@return string?
@@ -158,7 +212,7 @@ end
 
 ---Generates and returns a random number plate with the given pattern.
 ---Note that the generated plate may or may not be already used by an existing vehicle.
----For more info about the pattern see [`lib.string.random`](https://overextended.dev/ox_lib/Modules/String/Shared#stringrandom) from ox_lib.
+---For more info about the pattern see [`lib.string.random`](https://coxdocs.dev/ox_lib/Modules/String/Shared#stringrandom) from ox_lib.
 ---@param pattern? string
 ---@return string
 function qbx.generateRandomPlate(pattern)
@@ -210,7 +264,7 @@ if isServer then
     ---@field model integer
     ---@field spawnSource integer | vector3 | vector4 ped id or coords
     ---@field warp? boolean | integer a ped id to warp inside the vehicle, or additionally a boolean if `spawnSource` is a ped
-    ---@field props? table https://overextended.dev/ox_lib/Modules/VehicleProperties/Client#vehicle-properties
+    ---@field props? table https://coxdocs.dev/ox_lib/Modules/VehicleProperties/Client#vehicle-properties
     ---@field bucket? integer routing bucket to move spawned entity to.
 
     ---Creates a vehicle on the server-side and returns its `netId`.
@@ -249,52 +303,89 @@ if isServer then
             coords = vec4(pedCoords.x, pedCoords.y, pedCoords.z, GetEntityHeading(source))
         end
 
-        local tempVehicle = CreateVehicle(model, 0, 0, -200, 0, true, true)
-        while not DoesEntityExist(tempVehicle) do Wait(0) end
+        local vehicleType = exports.qbx_core:GetVehiclesByHash(joaat(model)).type
+        if not vehicleType then
+            warn(('No vehicle type found for model: %s temp vehicle was created and taken in type'):format(
+                model))
 
-        local vehicleType = GetVehicleType(tempVehicle)
-        DeleteEntity(tempVehicle)
+            local tempVehicle = CreateVehicle(model, 0, 0, -200, 0, true, true)
+            while not DoesEntityExist(tempVehicle) do Wait(0) end
 
-        local veh = CreateVehicleServerSetter(model, vehicleType, coords.x, coords.y, coords.z, coords.w)
-        while not DoesEntityExist(veh) do Wait(0) end
-        while GetVehicleNumberPlateText(veh) == '' do Wait(0) end
-
-        if bucket and bucket > 0 then
-            SetEntityBucket(veh, bucket)
+            vehicleType = GetVehicleType(tempVehicle)
+            DeleteEntity(tempVehicle)
         end
 
-        if ped then
-            SetPedIntoVehicle(ped, veh, -1)
-        end
+        local attempts = 0
 
-        lib.waitFor(function()
-            local owner = NetworkGetEntityOwner(veh)
+        local veh, netId
+        while attempts < 3 do
+            veh = CreateVehicleServerSetter(model, vehicleType, coords.x, coords.y, coords.z, coords.w)
+
+            if bucket and bucket > 0 then
+                exports.qbx_core:SetEntityBucket(veh, bucket)
+            end
+
+            while not DoesEntityExist(veh) do Wait(0) end
+            while GetVehicleNumberPlateText(veh) == '' do Wait(0) end
+
             if ped then
-                --- the owner should be transferred to the driver
-                if owner == NetworkGetEntityOwner(ped) then return true end
-            else
-                if owner ~= -1 then return true end
+                SetPedIntoVehicle(ped, veh, -1)
             end
-        end, 'client never set as owner', 5000)
 
-        local state = Entity(veh).state
-        state:set('initVehicle', true, true)
-
-        if props and type(props) == 'table' and props.plate then
-            state:set('setVehicleProperties', props, true)
-            local success = lib.waitFor(function()
-                if qbx.string.trim(GetVehicleNumberPlateText(veh)) == qbx.string.trim(props.plate) then
-                    return true
-                end
-            end, 'Failed to set vehicle properties within 5 seconds', 5000)
-            if not success then
+            if not pcall(function()
+                lib.waitFor(function()
+                    local owner = NetworkGetEntityOwner(veh)
+                    if ped then
+                        --- the owner should be transferred to the driver
+                        if owner == NetworkGetEntityOwner(ped) then return true end
+                    else
+                        if owner ~= -1 then return true end
+                    end
+                end, 'client never set as owner', 5000)
+            end) then
                 DeleteEntity(veh)
-                error('Deleting vehicle which timed out setting vehicle properties')
+                error('Deleting vehicle which timed out finding an owner')
+            end
+
+            local state = Entity(veh).state
+            local owner = NetworkGetEntityOwner(veh)
+            state:set('initVehicle', true, true)
+            netId = NetworkGetNetworkIdFromEntity(veh)
+            if props and type(props) == 'table' and props.plate then
+                TriggerClientEvent('qbx_core:client:setVehicleProperties', owner, netId, props)
+                local success = pcall(function()
+                    local plateMatched = false
+                    lib.waitFor(function()
+                        if qbx.string.trim(GetVehicleNumberPlateText(veh)) == qbx.string.trim(props.plate) then
+                            local currentOwner = NetworkGetEntityOwner(veh)
+                            assert(currentOwner == owner, ('Owner changed during vehicle init. expected=%s, actual=%s'):format(owner, currentOwner))
+                            --- check that the plate matches twice, 100ms apart as a bug has been observed in which server side matches but plate is not observed by clients to match
+                            if plateMatched then
+                                return true
+                            end
+                            plateMatched = true
+                            Wait(100)
+                        end
+                    end, 'Failed to set vehicle properties within 1 second', 1000)
+                end)
+                if success then
+                    break
+                else
+                    DeleteEntity(veh)
+                    attempts += 1
+                end
+            else
+                break
             end
         end
 
-        local netId = NetworkGetNetworkIdFromEntity(veh)
+        if attempts == 3 then
+            error('unable to successfully spawn vehicle after 3 attempts')
+        end
 
+        --- prevent server from deleting a vehicle without an owner
+        SetEntityOrphanMode(veh, 2)
+        exports.qbx_core:EnablePersistence(veh)
         return netId, veh
     end
 else
@@ -303,6 +394,8 @@ else
     ---@field scale? integer default: `0.35`
     ---@field font? integer default: `4`
     ---@field color? vector4 rgba, white by default
+    ---@field enableDropShadow? boolean
+    ---@field enableOutline? boolean
 
     ---@class LibDrawText2DParams : LibDrawTextParams
     ---@field coords vector2
@@ -319,12 +412,19 @@ else
         local color = params.color or vec4(255, 255, 255, 255)
         local width = params.width or 1.0
         local height = params.height or 1.0
+        local enableDropShadow = params.enableDropShadow or false
+        local enableOutline = params.enableOutline or false
 
         SetTextScale(scale, scale)
         SetTextFont(font)
         SetTextColour(math.floor(color.r), math.floor(color.g), math.floor(color.b), math.floor(color.a))
-        SetTextDropShadow()
-        SetTextOutline()
+        if enableDropShadow then
+            SetTextDropShadow()
+        end
+        if enableOutline then
+            SetTextOutline()
+        end
+
         SetTextCentre(true)
         BeginTextCommandDisplayText('STRING')
         AddTextComponentSubstringPlayerName(text)
@@ -334,19 +434,31 @@ else
     ---@class LibDrawText3DParams : LibDrawTextParams
     ---@field coords vector3
     ---@field disableDrawRect? boolean
+    ---@field scale? integer | vector2 default: `vec2(0.35,0.35)`
 
     ---Draws text onto the screen in 3D space for a single frame.
     ---@param params LibDrawText3DParams
     function qbx.drawText3d(params) -- luacheck: ignore
+        local isScaleparamANumber = type(params.scale) == "number"
         local text = params.text
         local coords = params.coords
-        local scale = params.scale or 0.35
+        local scale = (isScaleparamANumber and vec2(params.scale, params.scale))
+        or params.scale
+        or vec2(0.35, 0.35)
         local font = params.font or 4
         local color = params.color or vec4(255, 255, 255, 255)
+        local enableDropShadow = params.enableDropShadow or false
+        local enableOutline = params.enableOutline or false
 
-        SetTextScale(scale, scale)
+        SetTextScale(scale.x, scale.y)
         SetTextFont(font)
         SetTextColour(math.floor(color.r), math.floor(color.g), math.floor(color.b), math.floor(color.a))
+        if enableDropShadow then
+            SetTextDropShadow()
+        end
+        if enableOutline then
+            SetTextOutline()
+        end
         SetTextCentre(true)
         BeginTextCommandDisplayText('STRING')
         AddTextComponentSubstringPlayerName(text)
@@ -488,6 +600,15 @@ else
         return not tble[armIndex]
     end
 
+    --- Returns if the local ped is wearing a duffel bag.
+    --- @return boolean
+    function qbx.isWearingDuffelbag()
+        local torsoIndex = GetPedDrawableVariation(cache.ped, 5) -- Duffel bags are in component 5
+        local model = GetEntityModel(cache.ped)
+        local tble = qbx.duffelbagIndexes[model == `mp_m_freemode_01` and 'male' or 'female']
+        return tble[torsoIndex] == true
+    end
+
     ---Attempts to load an audio bank and returns whether it was successful.
     ---Remember to use `ReleaseScriptAudioBank` since you can only load up to 10 banks.
     ---@param audioBank string
@@ -508,6 +629,7 @@ else
     ---@field audioSource? number | vector3 entity handle or vector3 coords
     ---@field range? number only used if `audioSource` is a vector3 coordinate
 
+    ---@deprecated use mana_audio instead
     ---Plays a sound with the provided audio name and audio ref.
     ---If `returnSoundId` is false or not specified the soundId is released,
     ---otherwise the function returns the soundId without releasing it.
@@ -533,7 +655,7 @@ else
         end
 
         if returnSoundId then
-           return soundId
+            return soundId
         end
 
         ReleaseSoundId(soundId)
